@@ -692,6 +692,18 @@ pub fn read_plan(
         None => total,
     };
     let mut chunks = Vec::new();
+    // An empty range (zero-length read, or an offset at/after the requested end) intersects nothing —
+    // return no chunks so the client fetches no bytes for a read that wants none.
+    if offset >= end {
+        return ReadPlan {
+            object_cid: object_cid.to_string(),
+            total_size: total,
+            chunk_size: manifest.chunk_size,
+            chunks,
+            encrypted: false,
+            key_hint: None,
+        };
+    }
     let mut pos = 0u64;
     for cid in &manifest.chunks {
         // The manifest stores chunk CIDs in order; each is `chunk_size` except possibly the last.
@@ -777,5 +789,182 @@ mod tests {
         assert_eq!(split_path("/a/b/c"), Some(("/a/b".into(), "c".into())));
         assert_eq!(split_path("/x"), Some(("/".into(), "x".into())));
         assert_eq!(split_path("/"), None);
+    }
+
+    #[test]
+    fn split_path_normalizes_first() {
+        // Un-normalized inputs (trailing/leading/duplicate slashes, no leading slash) are normalized
+        // before splitting, so the parent/leaf split is stable.
+        assert_eq!(split_path("a/b"), Some(("/a".into(), "b".into())));
+        assert_eq!(split_path("/a/b/"), Some(("/a".into(), "b".into())));
+        assert_eq!(split_path("///"), None); // collapses to root
+        assert_eq!(split_path("  /a/b  "), Some(("/a".into(), "b".into())));
+    }
+
+    #[test]
+    fn norm_path_canonicalizes() {
+        assert_eq!(norm_path("/"), "/");
+        assert_eq!(norm_path(""), "/");
+        assert_eq!(norm_path("   "), "/");
+        assert_eq!(norm_path("/a/"), "/a");
+        assert_eq!(norm_path("a"), "/a");
+        assert_eq!(norm_path("/a/b/"), "/a/b");
+        assert_eq!(norm_path("//a//b//"), "/a//b"); // only leading/trailing slashes trimmed
+    }
+
+    #[test]
+    fn no_dotdot_guards_traversal() {
+        assert!(no_dotdot("/a/b").is_ok());
+        assert!(no_dotdot("/").is_ok());
+        // A literal ".." segment anywhere is rejected.
+        assert_eq!(no_dotdot("/a/../b").unwrap_err(), DriveErr::BadPath);
+        assert_eq!(no_dotdot("../x").unwrap_err(), DriveErr::BadPath);
+        assert_eq!(no_dotdot("/a/b/..").unwrap_err(), DriveErr::BadPath);
+        // "..." and "a..b" are NOT traversal (only the exact ".." segment is).
+        assert!(no_dotdot("/a/...").is_ok());
+        assert!(no_dotdot("/a..b/c").is_ok());
+    }
+
+    #[test]
+    fn enforce_prefix_subtree_rules() {
+        // A leaf scoped to /docs admits /docs and any descendant, rejects siblings + prefix-ish names.
+        let host = id_for_test("enf-host");
+        let aud = id_for_test("enf-aud").node_id();
+        let leaf = SignedCapability::issue(
+            &host,
+            aud,
+            vec!["drive:read".into()],
+            Resource::Any,
+            Caveats { path_prefix: Some("/docs".into()), ..Default::default() },
+            1,
+            None,
+        );
+        assert!(enforce_prefix(&leaf, "/docs").is_ok());
+        assert!(enforce_prefix(&leaf, "/docs/sub/file").is_ok());
+        assert!(enforce_prefix(&leaf, "/docs/").is_ok()); // trailing slash normalized
+        assert_eq!(enforce_prefix(&leaf, "/docsX").unwrap_err(), DriveErr::OutOfScope); // not a child
+        assert_eq!(enforce_prefix(&leaf, "/other").unwrap_err(), DriveErr::OutOfScope);
+        assert_eq!(enforce_prefix(&leaf, "/").unwrap_err(), DriveErr::OutOfScope); // can't escape up
+    }
+
+    #[test]
+    fn enforce_prefix_root_admits_everything() {
+        let host = id_for_test("root-host");
+        let aud = id_for_test("root-aud").node_id();
+        let leaf = SignedCapability::issue(
+            &host,
+            aud,
+            vec!["drive:read".into()],
+            Resource::Any,
+            Caveats { path_prefix: Some("/".into()), ..Default::default() },
+            1,
+            None,
+        );
+        assert!(enforce_prefix(&leaf, "/anything/deep").is_ok());
+        assert!(enforce_prefix(&leaf, "/").is_ok());
+    }
+
+    #[test]
+    fn enforce_prefix_none_admits_everything() {
+        // A cap with no path_prefix caveat is unrestricted (the host still selects the tenant).
+        let host = id_for_test("nopfx-host");
+        let aud = id_for_test("nopfx-aud").node_id();
+        let leaf = SignedCapability::issue(
+            &host,
+            aud,
+            vec!["drive:read".into()],
+            Resource::Any,
+            Caveats::default(),
+            1,
+            None,
+        );
+        assert!(enforce_prefix(&leaf, "/whatever").is_ok());
+    }
+
+    // ----- read_plan boundary cases -----
+
+    #[test]
+    fn read_plan_zero_len_returns_no_chunks() {
+        let data: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
+        let (manifest, _) = chunk_object(&data, 1000);
+        let plan = read_plan("obj", &manifest, 500, Some(0));
+        assert!(plan.chunks.is_empty(), "a zero-length read intersects nothing");
+        assert_eq!(plan.total_size, 3000);
+    }
+
+    #[test]
+    fn read_plan_offset_past_end_returns_no_chunks() {
+        let data: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
+        let (manifest, _) = chunk_object(&data, 1000);
+        let plan = read_plan("obj", &manifest, 9000, Some(10));
+        assert!(plan.chunks.is_empty());
+    }
+
+    #[test]
+    fn read_plan_empty_object_has_no_chunks() {
+        let (manifest, _) = chunk_object(&[], 1000);
+        assert_eq!(manifest.total_size, 0);
+        let plan = read_plan("obj", &manifest, 0, None);
+        assert!(plan.chunks.is_empty());
+        assert_eq!(plan.total_size, 0);
+    }
+
+    #[test]
+    fn read_plan_len_clamps_to_total() {
+        let data: Vec<u8> = (0..2500u32).map(|i| i as u8).collect();
+        let (manifest, _) = chunk_object(&data, 1000);
+        // Ask for far more than exists -> still only the 3 real chunks, no over-read.
+        let plan = read_plan("obj", &manifest, 0, Some(u64::MAX));
+        assert_eq!(plan.chunks.len(), 3);
+        let covered: u64 = plan.chunks.iter().map(|c| c.len).sum();
+        assert_eq!(covered, 2500);
+    }
+
+    #[test]
+    fn read_plan_exact_chunk_boundary() {
+        let data: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
+        let (manifest, _) = chunk_object(&data, 1000);
+        // [1000, 2000) is exactly chunk 1; must not pull chunk 0 or chunk 2.
+        let plan = read_plan("obj", &manifest, 1000, Some(1000));
+        let offs: Vec<u64> = plan.chunks.iter().map(|c| c.offset).collect();
+        assert_eq!(offs, vec![1000]);
+    }
+
+    #[test]
+    fn read_plan_last_chunk_is_partial() {
+        let data: Vec<u8> = (0..2500u32).map(|i| i as u8).collect();
+        let (manifest, _) = chunk_object(&data, 1000);
+        let plan = read_plan("obj", &manifest, 0, None);
+        // 2500 = 1000 + 1000 + 500; the last chunk's len is the remainder.
+        assert_eq!(plan.chunks.last().unwrap().len, 500);
+        assert_eq!(plan.chunks.last().unwrap().offset, 2000);
+    }
+
+    #[test]
+    fn derive_nonce_is_deterministic_and_path_sensitive() {
+        let a = derive_nonce("abcd", "/docs");
+        let b = derive_nonce("abcd", "/docs");
+        assert_eq!(a, b, "same (from, path) -> same nonce (stable, revocable)");
+        assert_ne!(derive_nonce("abcd", "/docs"), derive_nonce("abcd", "/other"));
+        assert_ne!(derive_nonce("abcd", "/docs"), derive_nonce("efef", "/docs"));
+    }
+
+    #[test]
+    fn parse_node_id_validates_length() {
+        assert!(parse_node_id(&"ab".repeat(32)).is_ok()); // 32 bytes
+        assert!(parse_node_id("nothex").is_err());
+        assert!(parse_node_id("abcd").is_err()); // too short
+        assert!(parse_node_id(&"ab".repeat(33)).is_err()); // too long
+    }
+
+    // test-only identity helper (private fns above are exercised with real signatures).
+    fn id_for_test(tag: &str) -> Identity {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("ce-drive-serve-unit-{}-{n}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Identity::load_or_generate(&dir).unwrap()
     }
 }

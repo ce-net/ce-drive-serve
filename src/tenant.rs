@@ -106,3 +106,95 @@ impl Registry {
         self.drives.keys().cloned().collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ce_drive_core::FileContent;
+
+    fn key_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("ce-drive-tenant-{}-{n}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn create_get_and_list_drives() {
+        let mut reg = Registry::new(key_dir("reg")).unwrap();
+        assert!(reg.drive_ids().is_empty());
+        assert!(reg.get("nope").is_none());
+
+        reg.create("team", Quota::default()).unwrap();
+        reg.create("personal", Quota::default()).unwrap();
+
+        assert!(reg.get("team").is_some());
+        assert!(reg.get_mut("personal").is_some());
+        let mut ids = reg.drive_ids();
+        ids.sort();
+        assert_eq!(ids, vec!["personal".to_string(), "team".to_string()]);
+    }
+
+    #[test]
+    fn duplicate_create_errors() {
+        let mut reg = Registry::new(key_dir("dup")).unwrap();
+        reg.create("team", Quota::default()).unwrap();
+        let err = reg.create("team", Quota::default()).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn host_id_hex_is_stable_64_hex() {
+        let dir = key_dir("hex");
+        let reg = Registry::new(&dir).unwrap();
+        let h = reg.host_id_hex().to_string();
+        assert_eq!(h.len(), 64);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+        // A second registry over the same key dir resolves the same host id (key is persisted).
+        let reg2 = Registry::new(&dir).unwrap();
+        assert_eq!(reg2.host_id_hex(), h);
+    }
+
+    #[test]
+    fn restore_rebuilds_drive_from_state_and_rejects_duplicates() {
+        // Build a drive, mutate it, snapshot its state, restore into a fresh registry.
+        let mut reg = Registry::new(key_dir("restore-src")).unwrap();
+        reg.create("team", Quota::default()).unwrap();
+        {
+            let t = reg.get_mut("team").unwrap();
+            t.drive.mkdir("/", "docs").unwrap();
+            let fc = FileContent::new("cid123", 10, 0o644, 1);
+            t.drive.add_file("/docs", "f.txt", fc).unwrap();
+        }
+        let state = reg.get("team").unwrap().drive.state().clone();
+
+        let mut reg2 = Registry::new(key_dir("restore-dst")).unwrap();
+        reg2.restore("team", state.clone(), Quota::default()).unwrap();
+        // The restored drive reflects the snapshot.
+        let entries = reg2.get("team").unwrap().drive.ls("/docs").unwrap();
+        assert!(entries.iter().any(|e| e.name == "f.txt"));
+        // The feed restarts at 0 (clients re-bootstrap from the snapshot, then Poll forward).
+        assert_eq!(reg2.get("team").unwrap().feed.cursor(), 0);
+        // Restoring the same id twice errors.
+        assert!(reg2.restore("team", state, Quota::default()).is_err());
+    }
+
+    #[test]
+    fn quota_is_carried_per_drive() {
+        let mut reg = Registry::new(key_dir("quota")).unwrap();
+        let q = Quota {
+            price_per_gib_month: "5".into(),
+            price_per_gib_egress: "2".into(),
+            free_tier_bytes: 1024,
+            channel_required: true,
+        };
+        reg.create("paid", q.clone()).unwrap();
+        let got = &reg.get("paid").unwrap().quota;
+        assert_eq!(got.price_per_gib_month, "5");
+        assert!(got.channel_required);
+        assert_eq!(got.free_tier_bytes, 1024);
+    }
+}

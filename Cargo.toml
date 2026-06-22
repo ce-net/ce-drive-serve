@@ -37,6 +37,7 @@ directories = "5"
 
 [dev-dependencies]
 tempfile = "3"
+proptest = "1"
 # In-process CE nodes for the two-node e2e test (same harness rdev/ce-node tests use).
 ce-node = { path = "../ce/crates/ce-node" }
 # The remote client, to drive the host loop end-to-end. Dev-only, so the dependency cycle

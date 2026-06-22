@@ -83,4 +83,94 @@ mod tests {
         assert!(page.is_empty());
         assert_eq!(cur, 5);
     }
+
+    #[test]
+    fn empty_feed_polls_empty() {
+        let f = Feed::new();
+        assert_eq!(f.cursor(), 0);
+        let (page, cur) = f.poll(0, 10);
+        assert!(page.is_empty());
+        assert_eq!(cur, 0);
+        // Polling from a future cursor on an empty feed returns nothing and keeps the cursor.
+        let (page, cur) = f.poll(99, 10);
+        assert!(page.is_empty());
+        assert_eq!(cur, 99);
+    }
+
+    #[test]
+    fn limit_zero_is_clamped_to_one() {
+        let mut f = Feed::new();
+        f.record("/a".into(), "n".into(), k(), "e".into());
+        f.record("/b".into(), "n".into(), k(), "e".into());
+        // limit 0 must not return an empty page forever (that would stall sync); it clamps to 1.
+        let (page, cur) = f.poll(0, 0);
+        assert_eq!(page.len(), 1);
+        assert_eq!(cur, 1);
+    }
+
+    #[test]
+    fn poll_past_the_end_is_gap_free_noop() {
+        let mut f = Feed::new();
+        for i in 0..3 {
+            f.record(format!("/f{i}"), "n".into(), k(), "e".into());
+        }
+        // Cursor at/after the tail returns nothing and is stable (resumable, no replay).
+        let (page, cur) = f.poll(3, 100);
+        assert!(page.is_empty());
+        assert_eq!(cur, 3);
+        let (page, cur) = f.poll(1000, 100);
+        assert!(page.is_empty());
+        assert_eq!(cur, 1000);
+    }
+
+    #[test]
+    fn full_drain_in_one_page_when_limit_large() {
+        let mut f = Feed::new();
+        for i in 0..50 {
+            f.record(format!("/f{i}"), "n".into(), k(), "e".into());
+        }
+        let (page, cur) = f.poll(0, u32::MAX);
+        assert_eq!(page.len(), 50);
+        assert_eq!(cur, 50);
+        // Sequence numbers are contiguous and strictly increasing (no gaps, no dups).
+        for (i, c) in page.iter().enumerate() {
+            assert_eq!(c.seq, i as u64 + 1);
+        }
+    }
+
+    #[test]
+    fn paging_covers_every_change_exactly_once() {
+        // Property-ish: paging the whole feed in small pages yields every seq exactly once, in order.
+        let mut f = Feed::new();
+        let n = 137;
+        for i in 0..n {
+            f.record(format!("/f{i}"), "n".into(), k(), "e".into());
+        }
+        let mut seen = Vec::new();
+        let mut cursor = 0u64;
+        loop {
+            let (page, cur) = f.poll(cursor, 7);
+            if page.is_empty() {
+                break;
+            }
+            for c in &page {
+                seen.push(c.seq);
+            }
+            cursor = cur;
+        }
+        let expected: Vec<u64> = (1..=n as u64).collect();
+        assert_eq!(seen, expected, "gap-free, dup-free, in-order coverage");
+    }
+
+    #[test]
+    fn change_kinds_preserved_in_feed() {
+        let mut f = Feed::new();
+        f.record("/a".into(), "n".into(), ChangeKind::Created, "e".into());
+        f.record("/b".into(), "n".into(), ChangeKind::Modified, "e".into());
+        f.record("/c".into(), "n".into(), ChangeKind::Deleted, "e".into());
+        f.record("/d".into(), "n".into(), ChangeKind::Moved { from: "/x".into() }, "e".into());
+        let (page, _) = f.poll(0, 100);
+        assert_eq!(page[0].kind, ChangeKind::Created);
+        assert_eq!(page[3].kind, ChangeKind::Moved { from: "/x".into() });
+    }
 }

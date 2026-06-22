@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout ce-drive-serve
+        uses: actions/checkout@v4
+        with:
+          path: ce-drive-serve
+
+      # Path dependency: ce-drive-serve depends on ../ce-rs
+      - name: Checkout ce-rs
+        uses: actions/checkout@v4
+        with:
+          repository: ce-net/ce-rs
+          path: ce-rs
+
+      # Path dependency: ce-cap + ce-identity + ce-node + ce-container live inside ce-net/ce
+      - name: Checkout ce
+        uses: actions/checkout@v4
+        with:
+          repository: ce-net/ce
+          path: ce
+
+      # Path dependency: ce-drive-core lives in ../ce-drive/crates/ce-drive-core
+      - name: Checkout ce-drive
+        uses: actions/checkout@v4
+        with:
+          repository: ce-net/ce-drive
+          path: ce-drive
+
+      # Path dependency: dev-dependency on ../ce-drive-client (the v1 wire protocol peer)
+      - name: Checkout ce-drive-client
+        uses: actions/checkout@v4
+        with:
+          repository: ce-net/ce-drive-client
+          path: ce-drive-client
+
+      # Transitive path dependency: ce-drive-core depends on ../../../ce-coord
+      - name: Checkout ce-coord
+        uses: actions/checkout@v4
+        with:
+          repository: ce-net/ce-coord
+          path: ce-coord
+
+      # Transitive path dependency: ce-drive-core depends on ../../../rdev
+      - name: Checkout rdev
+        uses: actions/checkout@v4
+        with:
+          repository: ce-net/rdev
+          path: rdev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ce-drive-serve
+
+      - name: Build
+        working-directory: ce-drive-serve
+        run: cargo build --all --verbose
+
+      - name: Test
+        working-directory: ce-drive-serve
+        run: cargo test --all --verbose
