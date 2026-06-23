@@ -15,6 +15,12 @@ It is an **app over CE primitives** (`AppRequest` + content-addressed blobs + `c
   sender. The host runs the exact `rdev::handle_inner` pattern:
   `ce_cap::authorize(host_id, roots, &[], now, &from, ability, &chain, &is_revoked)`, then enforces
   the `drive_id` + `path_prefix` caveats (with a `..` traversal guard) — fail-closed.
+- The **drive id is bound into the leaf cap's `path_prefix`** as the namespaced segment
+  `ce-drive/<drive>[/<subtree>]` (the same pattern ce-db uses for `ce-db/<collection>`). The host
+  recovers that drive id and rejects the request unless it equals the requested drive *before any
+  op*, so a cap minted for one drive can never be replayed against another drive on the same host. A
+  cap whose prefix is not in this namespace authorizes nothing. Mint these with
+  `ce_drive_serve::drive_caveat_prefix(drive, path)`.
 - Metadata is answered from the [`ce-drive-core`](../ce-drive) `DriveTree` CRDT + content map.
 - **Bytes never travel on the metadata channel.** `Read` returns a `ReadPlan` (the manifest CID +
   the chunk refs covering the requested range); the client fetches those chunks directly from the
@@ -33,8 +39,9 @@ ce-drive-serve --drive team --name acme-eng
 
 The host key (which IS the capability root for every drive it serves) is loaded from `--key-dir`
 (default: the CE data dir's `identity/`). To grant a peer access, the host self-issues a `ce-cap`
-chain scoped by `drive:{read,write,share,...}` + `path_prefix` + expiry (e.g. via `ce grant`), and
-the peer presents it on every request.
+chain scoped by `drive:{read,write,share,...}` + a drive-bound `path_prefix`
+(`ce_drive_serve::drive_caveat_prefix(drive, path)`, e.g. `ce-drive/team/docs`) + expiry, and the
+peer presents it on every request.
 
 ## Authorization vocabulary
 

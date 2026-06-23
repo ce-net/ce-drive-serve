@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use ce_cap::{Caveats, Resource, SignedCapability, encode_chain};
 use ce_drive_client::{Mirror, RemoteDrive};
-use ce_drive_serve::{DriveServer, Quota, Registry};
+use ce_drive_serve::{DriveServer, Quota, Registry, drive_caveat_prefix};
 use ce_identity::Identity;
 use ce_node::{Node, NodeConfig};
 use ce_rs::CeClient;
@@ -128,7 +128,7 @@ async fn remote_drive_open_write_read_and_mirror() {
         a_id,
         vec!["drive:read".into(), "drive:comment".into(), "drive:write".into(), "drive:admin".into()],
         Resource::Any,
-        Caveats { path_prefix: Some("/".into()), ..Default::default() },
+        Caveats { path_prefix: Some(drive_caveat_prefix("team", "/")), ..Default::default() },
         1,
         None,
     );

@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use ce_cap::{Caveats, Resource, SignedCapability, encode_chain};
 use ce_drive_client::{Mirror, RemoteDrive, ShareCaveats};
-use ce_drive_serve::{DriveServer, Quota, Registry};
+use ce_drive_serve::{DriveServer, Quota, Registry, drive_caveat_prefix};
 use ce_identity::Identity;
 use ce_node::{Node, NodeConfig};
 use ce_rs::CeClient;
@@ -91,7 +91,7 @@ fn full_cap(host: &Identity, audience: ce_identity::NodeId, nonce: u64) -> Strin
         audience,
         vec!["drive:read".into(), "drive:write".into(), "drive:admin".into()],
         Resource::Any,
-        Caveats { path_prefix: Some("/".into()), ..Default::default() },
+        Caveats { path_prefix: Some(drive_caveat_prefix("team", "/")), ..Default::default() },
         nonce,
         None,
     );
@@ -105,7 +105,7 @@ fn readonly_cap(host: &Identity, audience: ce_identity::NodeId, nonce: u64) -> S
         audience,
         vec!["drive:read".into()],
         Resource::Any,
-        Caveats { path_prefix: Some("/".into()), ..Default::default() },
+        Caveats { path_prefix: Some(drive_caveat_prefix("team", "/")), ..Default::default() },
         nonce,
         None,
     );
@@ -324,7 +324,13 @@ async fn full_op_set_capability_gated_over_two_nodes() {
     assert_eq!(leaf.cap.audience, carol, "shared cap audience is carol");
     assert!(leaf.cap.abilities.contains(&"drive:read".to_string()));
     assert!(!leaf.cap.abilities.contains(&"drive:write".to_string()), "share never widens to write");
-    assert_eq!(leaf.cap.caveats.path_prefix.as_deref(), Some("/docs"), "share is scoped to /docs");
+    // The minted sub-cap carries the same drive binding as the parent (`ce-drive/<drive>/<path>`),
+    // narrowed to the shared subtree — never drive-unbound, never a different drive.
+    assert_eq!(
+        leaf.cap.caveats.path_prefix.as_deref(),
+        Some(drive_caveat_prefix("team", "/docs").as_str()),
+        "share is scoped to /docs on drive team"
+    );
 
     serve_handle.abort();
 }

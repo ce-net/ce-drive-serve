@@ -12,9 +12,14 @@
 use std::collections::HashSet;
 
 use ce_cap::{Caveats, Resource, SignedCapability};
-use ce_drive_serve::{DriveErr, DriveOp, ShareCaveats, authorize_req, required_ability};
+use ce_drive_serve::{
+    DriveErr, DriveOp, ShareCaveats, authorize_req, drive_caveat_prefix, required_ability,
+};
 use ce_identity::{Identity, NodeId};
 use proptest::prelude::*;
+
+/// The drive id every cap in this file is bound to (matches the `drive` arg passed to authorize_req).
+const DRIVE: &str = "d";
 
 fn id(tag: &str) -> Identity {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,7 +54,7 @@ fn grant(
         Caveats {
             not_before,
             not_after,
-            path_prefix: Some(prefix.to_string()),
+            path_prefix: Some(drive_caveat_prefix(DRIVE, prefix)),
             ..Default::default()
         },
         nonce,
@@ -238,7 +243,7 @@ fn three_link_narrowing_chain_authorizes() {
         bob.node_id(),
         vec!["drive:read".into()],
         Resource::Any,
-        Caveats { path_prefix: Some("/docs".into()), ..Default::default() },
+        Caveats { path_prefix: Some(drive_caveat_prefix(DRIVE, "/docs")), ..Default::default() },
         2,
         Some(root.id()),
     );
@@ -305,7 +310,7 @@ proptest! {
             bob.node_id(),
             child_abilities.clone(),
             Resource::Any,
-            Caveats { path_prefix: Some(child_prefix.to_string()), ..Default::default() },
+            Caveats { path_prefix: Some(drive_caveat_prefix(DRIVE, child_prefix)), ..Default::default() },
             2,
             Some(root.id()),
         );

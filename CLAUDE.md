@@ -5,7 +5,10 @@ The **host** side of the CE Drive mesh API. An app over CE primitives (no node c
 ## What this crate is
 A server that exposes the `ce-drive/v1` AppRequest op set over the CE mesh and authorizes EVERY
 request against a presented `ce-cap` chain via `ce_cap::authorize`, then enforces drive-id +
-`path_prefix` caveats (fail-closed, `..`-guarded). Metadata is served from `ce-drive-core`'s
+`path_prefix` caveats (fail-closed, `..`-guarded). The drive id is bound into the leaf cap's
+`path_prefix` as `ce-drive/<drive>[/<subtree>]` (mirror of ce-db's `ce-db/<collection>`); a cap
+minted for drive A cannot be replayed against drive B on the same host. Mint with
+`drive_caveat_prefix(drive, path)`. Metadata is served from `ce-drive-core`'s
 `DriveTree` CRDT + content map; bytes are content-addressed blobs (`Read` returns a `ReadPlan`, never
 bytes; `Write` commits a `path -> object_cid` binding).
 

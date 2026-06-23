@@ -23,7 +23,7 @@ pub mod serve;
 pub mod tenant;
 pub mod wire;
 
-pub use serve::{DriveServer, authorize_req, read_plan, required_ability};
+pub use serve::{DriveServer, authorize_req, drive_caveat_prefix, read_plan, required_ability};
 pub use tenant::{Registry, Tenant};
 pub use wire::{
     Beacon, Change, ChangeKind, ChunkRef, DriveErr, DriveOk, DriveOp, DriveReply, DriveReq, Entry,

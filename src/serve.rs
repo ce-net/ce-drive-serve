@@ -5,6 +5,14 @@
 //! `ce_cap::authorize(host_id, roots, &[], now, &from_node, ability, &chain, &is_revoked)` and then
 //! enforces the drive-id + path-prefix caveats (with a `..` traversal guard) before any work. No
 //! ACL table, no per-file permission row — authorization is a pure local function of the chain.
+//!
+//! The **drive id is bound into the leaf cap's `path_prefix`** as the namespaced leading segment
+//! `ce-drive/<drive>[/<subtree>]` (mirroring ce-db's `ce-db/<collection>` and ce-storage's
+//! `<bucket>/<prefix>`). [`authorize_req`] recovers that drive id and rejects the request unless it
+//! equals `req.drive` BEFORE any op — so a cap minted for drive A can never authorize the same
+//! op+path on drive B/C on the same host. A cap whose prefix is not in this namespace authorizes
+//! nothing (fail-closed). Share mints sub-caps carrying the same drive binding (see
+//! [`drive_caveat_prefix`]).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -66,6 +74,46 @@ fn norm_path(p: &str) -> String {
     if t.is_empty() { "/".to_string() } else { format!("/{t}") }
 }
 
+/// The caveat namespace that binds a Drive capability to one drive id. Mirrors ce-db's
+/// `ce-db/<collection>` and ce-storage's `<bucket>/<prefix>`: the drive id is carried as the leading
+/// segment of the leaf cap's `path_prefix`, so the same primitive that confines an op to a subtree
+/// also pins the grant to a single drive. A cap minted for drive A can therefore never be replayed
+/// against drive B on the same host.
+const DRIVE_NS: &str = "ce-drive/";
+
+/// Build the drive-bound `path_prefix` caveat for `(drive, path)`: `ce-drive/<drive>` followed by the
+/// normalized path subtree (root contributes no path tail). `Caveats::is_narrower_or_equal` (in
+/// `ce-cap`, a `starts_with` check) keeps attenuation honest across this combined string.
+///
+/// This is the canonical way to mint a Drive cap's `path_prefix`: callers (the owner issuing a root
+/// grant, or `ce-drive-client`) MUST use it so the host's authorize gate can recover the drive id and
+/// reject cross-drive replay. A cap whose prefix is not in this namespace authorizes nothing.
+pub fn drive_caveat_prefix(drive: &str, path: &str) -> String {
+    drive_prefix(drive, path)
+}
+
+/// Build the drive-bound `path_prefix` caveat for `(drive, path)`: `ce-drive/<drive>` followed by the
+/// normalized path subtree (root contributes no path tail). `Caveats::is_narrower_or_equal` (in
+/// `ce-cap`, a `starts_with` check) keeps attenuation honest across this combined string.
+fn drive_prefix(drive: &str, path: &str) -> String {
+    let norm = norm_path(path);
+    if norm == "/" { format!("{DRIVE_NS}{drive}") } else { format!("{DRIVE_NS}{drive}{norm}") }
+}
+
+/// Decode a drive-bound `path_prefix` caveat into `(drive_id, path_subtree)`. The subtree is a normal
+/// drive path (`/` = drive-wide). Returns `None` if the prefix is not in the `ce-drive/<drive>...`
+/// namespace (an unbound or foreign cap, which authorizes nothing here).
+fn parse_drive_prefix(prefix: &str) -> Option<(String, String)> {
+    let rest = prefix.strip_prefix(DRIVE_NS)?;
+    // `rest` is `<drive>` or `<drive>/<path...>`. The drive id never contains a `/`.
+    match rest.split_once('/') {
+        Some((drive, path)) if !drive.is_empty() => Some((drive.to_string(), norm_path(path))),
+        Some(_) => None, // empty drive id
+        None if !rest.is_empty() => Some((rest.to_string(), "/".to_string())),
+        None => None,
+    }
+}
+
 /// Reject `..` traversal in a path.
 fn no_dotdot(p: &str) -> Result<(), DriveErr> {
     if p.split('/').any(|c| c == "..") {
@@ -105,32 +153,38 @@ pub fn authorize_req(
 
     // Gate 2: drive-id + path-prefix caveats (the action-layer enforcement ce-cap delegates).
     let leaf = chain.last().ok_or(DriveErr::Unauthorized)?;
-    // drive_id caveat is encoded in the path_prefix's leading segment only if set; we keep a
-    // dedicated check: a cap is bound to a drive by being issued for it. Here the host already
-    // selected the tenant by `drive`, and the cap roots at the host, so cross-drive use is bounded
-    // by the path_prefix subtree. (A multi-drive caveat split is a v2 refinement.)
+    // The drive id is pinned in the leaf's `path_prefix` (`ce-drive/<drive>[/<subtree>]`). A cap with
+    // no such binding authorizes nothing here (fail-closed): without it a cap issued for drive A
+    // would authorize the identical op+path on drive B/C on the same host. Verify the binding BEFORE
+    // any op, and recover the path subtree the cap is confined to.
+    let bound_prefix = leaf.cap.caveats.path_prefix.as_deref().ok_or(DriveErr::Unauthorized)?;
+    let (bound_drive, path_scope) =
+        parse_drive_prefix(bound_prefix).ok_or(DriveErr::Unauthorized)?;
+    if bound_drive != drive {
+        // Cap minted for a different drive on this host — refuse before doing any work.
+        return Err(DriveErr::OutOfScope);
+    }
+
     if let Some(path) = op_path(op) {
         no_dotdot(path)?;
         // Move/Copy also need the source checked.
         if let DriveOp::Move { from, .. } | DriveOp::Copy { from, .. } = op {
             no_dotdot(from)?;
-            enforce_prefix(leaf, from)?;
+            enforce_prefix(&path_scope, from)?;
         }
-        enforce_prefix(leaf, path)?;
+        enforce_prefix(&path_scope, path)?;
     }
-    let _ = drive;
     Ok(leaf.cap.abilities.clone())
 }
 
-/// Enforce the leaf cap's `path_prefix` caveat against `path` (fail-closed).
-fn enforce_prefix(leaf: &SignedCapability, path: &str) -> Result<(), DriveErr> {
-    if let Some(prefix) = leaf.cap.caveats.path_prefix.as_ref() {
-        let norm = norm_path(path);
-        let pfx = norm_path(prefix);
-        let ok = pfx == "/" || norm == pfx || norm.starts_with(&format!("{pfx}/"));
-        if !ok {
-            return Err(DriveErr::OutOfScope);
-        }
+/// Enforce the cap's path-subtree caveat (decoded from the drive-bound prefix) against `path`
+/// (fail-closed). `scope` is a normal drive path; `/` means drive-wide (no path confinement).
+fn enforce_prefix(scope: &str, path: &str) -> Result<(), DriveErr> {
+    let norm = norm_path(path);
+    let pfx = norm_path(scope);
+    let ok = pfx == "/" || norm == pfx || norm.starts_with(&format!("{pfx}/"));
+    if !ok {
+        return Err(DriveErr::OutOfScope);
     }
     Ok(())
 }
@@ -549,7 +603,7 @@ impl DriveServer {
     #[allow(clippy::too_many_arguments)]
     async fn op_share(
         &self,
-        _drive_id: &str,
+        drive_id: &str,
         from_hex: &str,
         chain: &[SignedCapability],
         path: &str,
@@ -565,7 +619,16 @@ impl DriveServer {
         let parent = chain.last().ok_or(DriveErr::Unauthorized)?;
         let audience_id = parse_node_id(audience).map_err(|_| DriveErr::BadPath)?;
         no_dotdot(path).map_err(|_| DriveErr::BadPath)?;
-        enforce_prefix(parent, path)?;
+        // The parent's drive binding + path subtree (authorize_req already proved it pins `drive_id`).
+        let parent_scope = parent
+            .cap
+            .caveats
+            .path_prefix
+            .as_deref()
+            .and_then(parse_drive_prefix)
+            .map(|(_, scope)| scope)
+            .ok_or(DriveErr::Unauthorized)?;
+        enforce_prefix(&parent_scope, path)?;
 
         // Abilities ∩ caller's (never exceed). Default to read if none requested.
         let requested: Vec<String> = if abilities.is_empty() {
@@ -587,9 +650,12 @@ impl DriveServer {
             (c, 0) => c,
             (c, p) => c.min(p),
         };
+        // Mint with the SAME drive binding as the parent (`ce-drive/<drive>/<path>`), narrowed to
+        // the shared subtree. Without this the sub-cap would be drive-unbound and Gate 2 would refuse
+        // it on every drive — and it must never authorize a different drive than the one shared.
         let new_caveats = Caveats {
             not_after,
-            path_prefix: Some(norm_path(path)),
+            path_prefix: Some(drive_prefix(drive_id, path)),
             ..Default::default()
         };
         // Issue as a child of the caller's leaf so attenuation chains correctly. The caller is the
@@ -827,58 +893,49 @@ mod tests {
 
     #[test]
     fn enforce_prefix_subtree_rules() {
-        // A leaf scoped to /docs admits /docs and any descendant, rejects siblings + prefix-ish names.
-        let host = id_for_test("enf-host");
-        let aud = id_for_test("enf-aud").node_id();
-        let leaf = SignedCapability::issue(
-            &host,
-            aud,
-            vec!["drive:read".into()],
-            Resource::Any,
-            Caveats { path_prefix: Some("/docs".into()), ..Default::default() },
-            1,
-            None,
-        );
-        assert!(enforce_prefix(&leaf, "/docs").is_ok());
-        assert!(enforce_prefix(&leaf, "/docs/sub/file").is_ok());
-        assert!(enforce_prefix(&leaf, "/docs/").is_ok()); // trailing slash normalized
-        assert_eq!(enforce_prefix(&leaf, "/docsX").unwrap_err(), DriveErr::OutOfScope); // not a child
-        assert_eq!(enforce_prefix(&leaf, "/other").unwrap_err(), DriveErr::OutOfScope);
-        assert_eq!(enforce_prefix(&leaf, "/").unwrap_err(), DriveErr::OutOfScope); // can't escape up
+        // A scope of /docs admits /docs and any descendant, rejects siblings + prefix-ish names.
+        assert!(enforce_prefix("/docs", "/docs").is_ok());
+        assert!(enforce_prefix("/docs", "/docs/sub/file").is_ok());
+        assert!(enforce_prefix("/docs", "/docs/").is_ok()); // trailing slash normalized
+        assert_eq!(enforce_prefix("/docs", "/docsX").unwrap_err(), DriveErr::OutOfScope); // not a child
+        assert_eq!(enforce_prefix("/docs", "/other").unwrap_err(), DriveErr::OutOfScope);
+        assert_eq!(enforce_prefix("/docs", "/").unwrap_err(), DriveErr::OutOfScope); // can't escape up
     }
 
     #[test]
     fn enforce_prefix_root_admits_everything() {
-        let host = id_for_test("root-host");
-        let aud = id_for_test("root-aud").node_id();
-        let leaf = SignedCapability::issue(
-            &host,
-            aud,
-            vec!["drive:read".into()],
-            Resource::Any,
-            Caveats { path_prefix: Some("/".into()), ..Default::default() },
-            1,
-            None,
-        );
-        assert!(enforce_prefix(&leaf, "/anything/deep").is_ok());
-        assert!(enforce_prefix(&leaf, "/").is_ok());
+        assert!(enforce_prefix("/", "/anything/deep").is_ok());
+        assert!(enforce_prefix("/", "/").is_ok());
     }
 
     #[test]
-    fn enforce_prefix_none_admits_everything() {
-        // A cap with no path_prefix caveat is unrestricted (the host still selects the tenant).
-        let host = id_for_test("nopfx-host");
-        let aud = id_for_test("nopfx-aud").node_id();
-        let leaf = SignedCapability::issue(
-            &host,
-            aud,
-            vec!["drive:read".into()],
-            Resource::Any,
-            Caveats::default(),
-            1,
-            None,
-        );
-        assert!(enforce_prefix(&leaf, "/whatever").is_ok());
+    fn drive_prefix_roundtrips() {
+        // Drive-wide cap: `ce-drive/<drive>` decodes to (drive, "/").
+        let p = drive_prefix("work", "/");
+        assert_eq!(p, "ce-drive/work");
+        assert_eq!(parse_drive_prefix(&p), Some(("work".into(), "/".into())));
+
+        // Subtree cap: `ce-drive/<drive>/docs` decodes to (drive, "/docs").
+        let p = drive_prefix("work", "/docs");
+        assert_eq!(p, "ce-drive/work/docs");
+        assert_eq!(parse_drive_prefix(&p), Some(("work".into(), "/docs".into())));
+
+        // Deeper subtree, with input-path normalization (trailing slash dropped).
+        let p = drive_prefix("acme-drive", "/a/b/");
+        assert_eq!(p, "ce-drive/acme-drive/a/b");
+        assert_eq!(parse_drive_prefix(&p), Some(("acme-drive".into(), "/a/b".into())));
+    }
+
+    #[test]
+    fn parse_drive_prefix_rejects_unbound_and_foreign() {
+        // A bare path (the OLD, unbound caveat form) is not in the ce-drive namespace -> None.
+        assert_eq!(parse_drive_prefix("/docs"), None);
+        assert_eq!(parse_drive_prefix("/"), None);
+        // A foreign app's namespace (e.g. ce-db) is not a Drive binding.
+        assert_eq!(parse_drive_prefix("ce-db/users"), None);
+        // Empty drive id is rejected.
+        assert_eq!(parse_drive_prefix("ce-drive/"), None);
+        assert_eq!(parse_drive_prefix("ce-drive//docs"), None);
     }
 
     // ----- read_plan boundary cases -----

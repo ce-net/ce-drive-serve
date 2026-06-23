@@ -7,8 +7,11 @@
 use std::collections::HashSet;
 
 use ce_cap::{Caveats, Resource, SignedCapability};
-use ce_drive_serve::{DriveErr, DriveOp, authorize_req};
+use ce_drive_serve::{DriveErr, DriveOp, authorize_req, drive_caveat_prefix};
 use ce_identity::{Identity, NodeId};
+
+/// The drive id every cap in this file is bound to (matches the `drive` arg passed to authorize_req).
+const DRIVE: &str = "default";
 
 fn id(tag: &str) -> Identity {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -58,7 +61,11 @@ fn grant(
         audience,
         abilities.iter().map(|s| s.to_string()).collect(),
         Resource::Any,
-        Caveats { not_after, path_prefix: Some(prefix.to_string()), ..Default::default() },
+        Caveats {
+            not_after,
+            path_prefix: Some(drive_caveat_prefix(DRIVE, prefix)),
+            ..Default::default()
+        },
         1,
         None,
     )
@@ -186,7 +193,7 @@ fn attenuation_cannot_widen_read_to_write() {
         bob.node_id(),
         vec!["drive:read".into(), "drive:write".into()],
         Resource::Any,
-        Caveats { path_prefix: Some("/docs".into()), ..Default::default() },
+        Caveats { path_prefix: Some(drive_caveat_prefix(DRIVE, "/docs")), ..Default::default() },
         2,
         Some(root.id()),
     );
@@ -217,7 +224,7 @@ fn child_prefix_cannot_escape_parent() {
         bob.node_id(),
         vec!["drive:read".into()],
         Resource::Any,
-        Caveats { path_prefix: Some("/secrets".into()), ..Default::default() },
+        Caveats { path_prefix: Some(drive_caveat_prefix(DRIVE, "/secrets")), ..Default::default() },
         3,
         Some(root.id()),
     );
@@ -234,6 +241,102 @@ fn child_prefix_cannot_escape_parent() {
     );
     // ce-cap rejects the link (caveats broader than parent) before path enforcement.
     assert_eq!(r.unwrap_err(), DriveErr::Unauthorized);
+}
+
+/// REGRESSION (finding C1): a capability is bound to ONE drive. A cap minted for drive A must be
+/// rejected for the identical op+path on drive B/C on the same host, and accepted on drive A.
+///
+/// Before the fix, `authorize_req` ignored the `drive` argument (`let _ = drive;`) and the path
+/// caveat carried no drive id, so this same cap authorized the read on EVERY drive on the host. This
+/// test fails on that old behavior (drive_b would be `Ok`) and passes on the fix.
+#[test]
+fn cap_for_drive_a_is_rejected_on_drive_b() {
+    let host = id("host");
+    let alice = id("alice");
+    // Mint a read cap bound to drive "alpha" (the helper binds to DRIVE = "default"; here we bind
+    // explicitly to "alpha" to make the cross-drive boundary the subject under test).
+    let cap = SignedCapability::issue(
+        &host,
+        alice.node_id(),
+        vec!["drive:read".into()],
+        Resource::Any,
+        Caveats { path_prefix: Some(drive_caveat_prefix("alpha", "/docs")), ..Default::default() },
+        1,
+        None,
+    );
+
+    // Accepted on the drive it was issued for.
+    let on_a = authorize_req(
+        &host.node_id(),
+        &[],
+        "alpha",
+        &read_op("/docs/spec.md"),
+        &alice.node_id(),
+        std::slice::from_ref(&cap),
+        1000,
+        &no_revoked(),
+    );
+    assert!(on_a.is_ok(), "cap must authorize on its own drive: {on_a:?}");
+
+    // Rejected for the identical op+path on a DIFFERENT drive on the same host.
+    let on_b = authorize_req(
+        &host.node_id(),
+        &[],
+        "beta",
+        &read_op("/docs/spec.md"),
+        &alice.node_id(),
+        std::slice::from_ref(&cap),
+        1000,
+        &no_revoked(),
+    );
+    assert_eq!(
+        on_b.unwrap_err(),
+        DriveErr::OutOfScope,
+        "a cap for drive 'alpha' must NOT authorize the same op on drive 'beta'"
+    );
+
+    // And a third drive, just to be explicit it is a per-drive binding, not an alpha/beta toggle.
+    let on_c = authorize_req(
+        &host.node_id(),
+        &[],
+        "gamma",
+        &read_op("/docs/spec.md"),
+        &alice.node_id(),
+        std::slice::from_ref(&cap),
+        1000,
+        &no_revoked(),
+    );
+    assert_eq!(on_c.unwrap_err(), DriveErr::OutOfScope);
+}
+
+/// REGRESSION (finding C1): a cap with a drive-unbound (legacy bare-path) `path_prefix` authorizes
+/// nothing — the gate is fail-closed. Without this, an old-style cap would still be honored on any
+/// drive, re-opening the hole.
+#[test]
+fn drive_unbound_cap_is_rejected() {
+    let host = id("host");
+    let alice = id("alice");
+    let cap = SignedCapability::issue(
+        &host,
+        alice.node_id(),
+        vec!["drive:read".into()],
+        Resource::Any,
+        // Bare path prefix, NOT the `ce-drive/<drive>/...` namespace.
+        Caveats { path_prefix: Some("/docs".into()), ..Default::default() },
+        1,
+        None,
+    );
+    let r = authorize_req(
+        &host.node_id(),
+        &[],
+        "default",
+        &read_op("/docs/spec.md"),
+        &alice.node_id(),
+        &[cap],
+        1000,
+        &no_revoked(),
+    );
+    assert_eq!(r.unwrap_err(), DriveErr::Unauthorized, "an unbound cap must authorize nothing");
 }
 
 #[test]
