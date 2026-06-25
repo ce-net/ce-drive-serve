@@ -276,34 +276,57 @@ impl DriveServer {
         Ok(())
     }
 
-    /// Run the serve loop: poll inbound messages, dispatch `ce-drive/v1` requests, reply. Polls every
-    /// `poll_ms`. Runs until the process exits (cancel by dropping the task).
-    pub async fn run(&self, poll_ms: u64) -> Result<()> {
-        info!(host = %hex::encode(self.host_id), "ce-drive serve loop started");
+    /// Run the serve loop: consume the node's PUSH message stream (`/mesh/messages/stream`), decode
+    /// each `ce-drive/v1` request, authorize, dispatch, and reply. Push delivery removes the
+    /// poll-interval latency floor that a periodic `/mesh/messages` poll imposed on every op.
+    ///
+    /// `reconnect_ms` is only the backoff before re-opening the stream if it drops (the node restarts,
+    /// a transient SSE error). On each (re)connect we first drain `/mesh/messages` once so a request
+    /// that arrived during the connect gap is never missed; the `seen` set dedups the overlap.
+    /// Runs until the process exits (cancel by dropping the task).
+    pub async fn run(&self, reconnect_ms: u64) -> Result<()> {
+        use futures_util::StreamExt;
+        info!(host = %hex::encode(self.host_id), "ce-drive serve loop started (push stream)");
         let mut seen: HashSet<u64> = HashSet::new();
         loop {
-            match self.client.messages().await {
-                Ok(msgs) => {
-                    for m in msgs {
-                        let Some(token) = m.reply_token else { continue };
-                        if m.topic != crate::wire::DRIVE_TOPIC {
-                            continue;
-                        }
-                        if !seen.insert(token) {
-                            continue; // already handled this request token
-                        }
-                        if let Err(e) = self.handle_message(token, &m.from, &m.payload_hex).await {
-                            warn!(error = %e, "ce-drive request handling failed");
-                        }
-                    }
-                    // Bound the dedup set.
-                    if seen.len() > 4096 {
-                        seen.clear();
-                    }
+            // Catch anything buffered in the inbox while we were (re)connecting.
+            if let Ok(msgs) = self.client.messages().await {
+                for m in msgs {
+                    self.handle_inbound(&m, &mut seen).await;
                 }
-                Err(e) => debug!(error = %e, "poll /mesh/messages failed"),
             }
-            tokio::time::sleep(std::time::Duration::from_millis(poll_ms.max(50))).await;
+            match self.client.messages_stream().await {
+                Ok(stream) => {
+                    tokio::pin!(stream);
+                    while let Some(item) = stream.next().await {
+                        match item {
+                            Ok(m) => self.handle_inbound(&m, &mut seen).await,
+                            Err(e) => debug!(error = %e, "drive stream item error"),
+                        }
+                    }
+                    debug!("ce-drive message stream ended; reconnecting");
+                }
+                Err(e) => debug!(error = %e, "open /mesh/messages/stream failed; retrying"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(reconnect_ms.max(50))).await;
+        }
+    }
+
+    /// Filter, dedup, and dispatch one inbound app message (shared by the inbox drain + the stream).
+    async fn handle_inbound(&self, m: &ce_rs::AppMessage, seen: &mut HashSet<u64>) {
+        let Some(token) = m.reply_token else { return };
+        if m.topic != crate::wire::DRIVE_TOPIC {
+            return;
+        }
+        if !seen.insert(token) {
+            return; // already handled this request token
+        }
+        if seen.len() > 8192 {
+            seen.clear();
+            seen.insert(token);
+        }
+        if let Err(e) = self.handle_message(token, &m.from, &m.payload_hex).await {
+            warn!(error = %e, "ce-drive request handling failed");
         }
     }
 
