@@ -427,7 +427,28 @@ impl DriveServer {
         drive_id: &str,
         chain: &[SignedCapability],
     ) -> Result<DriveOk, DriveErr> {
-        // Publish a fresh bootstrap snapshot (serialized DriveState) and cache its CID.
+        let granted_abilities = chain.last().map(|c| c.cap.abilities.clone()).unwrap_or_default();
+
+        // Fast path: reuse the cached snapshot when the drive hasn't advanced since it was taken. A
+        // bootstrapping mirror replays the snapshot then Polls the feed for deltas since the
+        // snapshot's cursor, so the snapshot only needs to be CURRENT-ish, not per-open. This turns a
+        // repeated open/handshake (and every Mirror open) from a full serialize+put_object into O(1).
+        {
+            let reg = self.registry.lock().await;
+            let t = reg.get(drive_id).ok_or(DriveErr::NotFound)?;
+            if let Some((cid, snap_cursor)) = &t.snapshot {
+                if *snap_cursor == t.feed.cursor() {
+                    return Ok(DriveOk::Opened {
+                        drive_root_cid: cid.clone(),
+                        server_seq: *snap_cursor,
+                        granted_abilities,
+                        quota: t.quota.clone(),
+                    });
+                }
+            }
+        }
+
+        // Stale (or first) snapshot: (re)publish a fresh bootstrap snapshot and cache its CID.
         let state_bytes = {
             let reg = self.registry.lock().await;
             let t = reg.get(drive_id).ok_or(DriveErr::NotFound)?;
@@ -447,7 +468,6 @@ impl DriveServer {
             (cursor, t.quota.clone())
         };
 
-        let granted_abilities = chain.last().map(|c| c.cap.abilities.clone()).unwrap_or_default();
         Ok(DriveOk::Opened { drive_root_cid: cid, server_seq, granted_abilities, quota })
     }
 
