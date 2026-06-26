@@ -3,7 +3,7 @@ name = "ce-drive-serve"
 version = "0.1.0"
 edition = "2024"
 description = "CE Drive host — serves the ce-drive/v1 AppRequest op set over the CE mesh, authorizing every request against a presented ce-cap chain. An app over CE primitives (AppRequest + blobs + ce-cap); no node changes."
-license = "MIT"
+license = "AGPL-3.0-only"
 repository = "https://github.com/ce-net/ce-drive"
 authors = ["Leif Rydenfalk <ledamecrydenfalk@gmail.com>"]
 
