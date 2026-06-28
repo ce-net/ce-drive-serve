@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
-use ce_cap::{Caveats, Resource, SignedCapability, encode_chain};
+use ce_iam_core::{Caveats, Resource, SignedCapability, encode_chain};
 use ce_drive_client::{Mirror, RemoteDrive, ShareCaveats};
 use ce_drive_serve::{DriveServer, Quota, Registry, drive_caveat_prefix};
 use ce_identity::Identity;
@@ -319,7 +319,7 @@ async fn full_op_set_capability_gated_over_two_nodes() {
     assert!(!shared_token.is_empty());
     // Carol presents the shared cap from node A's client (audience binds to PeerId on the real mesh;
     // here we assert the host minted a non-empty, decodable chain scoped to /docs read).
-    let chain = ce_cap::decode_chain(&shared_token).expect("decode shared chain");
+    let chain = ce_iam_core::decode_chain(&shared_token).expect("decode shared chain");
     let leaf = chain.last().unwrap();
     assert_eq!(leaf.cap.audience, carol, "shared cap audience is carol");
     assert!(leaf.cap.abilities.contains(&"drive:read".to_string()));

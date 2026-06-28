@@ -7,7 +7,7 @@
 //! It is an **app over CE primitives** (`AppRequest` + content-addressed blobs + `ce-cap`), exactly
 //! per `ce/docs/primitives.md`: no new node RPC variant, no new HTTP endpoint, no node changes. The
 //! serve loop polls `/mesh/messages`, decodes each request, runs
-//! `ce_cap::authorize(host_id, roots, &[], now, &from, ability, &chain, &is_revoked)` (the same
+//! `ce_iam_core::authorize(host_id, roots, &[], now, &from, ability, &chain, &is_revoked)` (the same
 //! pattern `rdev::handle_inner` uses), enforces the drive-id + path-prefix caveats, then delegates to
 //! the [`ce_drive_core`] `DriveTree` + content map.
 //!

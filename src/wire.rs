@@ -26,7 +26,7 @@ pub fn changes_topic(drive_id: &str) -> String {
 pub struct DriveReq {
     /// Drive-id on the host (one host may serve many drives).
     pub drive: String,
-    /// Hex-encoded ce-cap chain (root-first), as produced by `ce_cap::encode_chain`.
+    /// Hex-encoded ce-cap chain (root-first), as produced by `ce_iam_core::encode_chain`.
     pub cap: String,
     /// The operation to perform.
     pub op: DriveOp,

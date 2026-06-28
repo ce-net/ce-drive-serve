@@ -2,7 +2,7 @@
 //! against the presented ce-cap chain, dispatch to the [`Registry`], and reply.
 //!
 //! Authorization is the discipline from `rdev::handle_inner` reused verbatim: every request runs
-//! `ce_cap::authorize(host_id, roots, &[], now, &from_node, ability, &chain, &is_revoked)` and then
+//! `ce_iam_core::authorize(host_id, roots, &[], now, &from_node, ability, &chain, &is_revoked)` and then
 //! enforces the drive-id + path-prefix caveats (with a `..` traversal guard) before any work. No
 //! ACL table, no per-file permission row — authorization is a pure local function of the chain.
 //!
@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use ce_cap::{Caveats, Resource, SignedCapability, authorize, decode_chain, encode_chain};
+use ce_iam_core::{Caveats, Resource, SignedCapability, authorize, decode_chain, encode_chain};
 use ce_drive_core::{Ability, DirEntry, NodeKind, ROOT};
 use ce_identity::{Identity, NodeId};
 use ce_rs::{CeClient, data};

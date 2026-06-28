@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
-use ce_cap::{Caveats, Resource, SignedCapability, encode_chain};
+use ce_iam_core::{Caveats, Resource, SignedCapability, encode_chain};
 use ce_drive_client::{Mirror, RemoteDrive};
 use ce_drive_serve::{DriveServer, Quota, Registry, drive_caveat_prefix};
 use ce_identity::Identity;

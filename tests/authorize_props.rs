@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 
-use ce_cap::{Caveats, Resource, SignedCapability};
+use ce_iam_core::{Caveats, Resource, SignedCapability};
 use ce_drive_serve::{
     DriveErr, DriveOp, ShareCaveats, authorize_req, drive_caveat_prefix, required_ability,
 };
@@ -44,7 +44,7 @@ fn grant(
     not_before: u64,
     not_after: u64,
     nonce: u64,
-    parent: Option<ce_cap::CapId>,
+    parent: Option<ce_iam_core::CapId>,
 ) -> SignedCapability {
     SignedCapability::issue(
         issuer,

@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use ce_cap::{Caveats, Resource, SignedCapability};
+use ce_iam_core::{Caveats, Resource, SignedCapability};
 use ce_drive_serve::{DriveErr, DriveOp, authorize_req, drive_caveat_prefix};
 use ce_identity::{Identity, NodeId};
 
