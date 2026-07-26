@@ -49,6 +49,15 @@ pub fn required_ability(op: &DriveOp) -> &'static str {
         DriveOp::Share { .. } => Ability::Admin.as_str(),
         // Poll/Watch use read (a reader may follow the change feed).
         DriveOp::Poll { .. } | DriveOp::Watch => Ability::Read.as_str(),
+        // Reading metadata is reading; changing it is writing. Metadata is as sensitive as the
+        // bytes it describes -- a tag or a link can leak what a file IS to someone who may not
+        // read it -- so it sits under the same abilities rather than being ungated "just metadata".
+        DriveOp::Meta { .. } | DriveOp::Backlinks { .. } | DriveOp::Versions { .. } => {
+            Ability::Read.as_str()
+        }
+        DriveOp::SetProp { .. } | DriveOp::Tag { .. } | DriveOp::Link { .. } => {
+            Ability::Write.as_str()
+        }
     }
 }
 
@@ -65,6 +74,14 @@ fn op_path<'a>(op: &'a DriveOp) -> Option<&'a str> {
         // Move/Copy: the destination is the binding write; both ends are checked in the handler.
         DriveOp::Move { to, .. } | DriveOp::Copy { to, .. } => Some(to),
         DriveOp::Open | DriveOp::Poll { .. } | DriveOp::Watch => None,
+        DriveOp::Meta { path }
+        | DriveOp::SetProp { path, .. }
+        | DriveOp::Tag { path, .. }
+        | DriveOp::Link { path, .. }
+        | DriveOp::Versions { path } => Some(path),
+        // Backlinks names a TARGET, not a path in this drive, so there is no subtree to scope to.
+        // It stays behind the drive-level read grant like Poll.
+        DriveOp::Backlinks { .. } => None,
     }
 }
 
@@ -193,7 +210,7 @@ fn enforce_prefix(scope: &str, path: &str) -> Result<(), DriveErr> {
 /// empty files. Cheap optimistic-concurrency token (matches one content-map version).
 fn etag_for(drive: &ce_drive_core::Drive, node_id: &str) -> String {
     match drive.content().get(node_id) {
-        Some(c) => format!("{}:{}", c.cid, c.mtime_ms),
+        Some(c) => format!("{}:{}", c.cid(), c.mtime_ms),
         None => format!("dir:{node_id}"),
     }
 }
@@ -206,7 +223,7 @@ fn entry_of(drive: &ce_drive_core::Drive, parent_path: &str, e: &DirEntry) -> En
         format!("{}/{}", parent_path.trim_end_matches('/'), e.name)
     };
     let (size, mtime_ms, object_cid, doc_id) = match &e.content {
-        Some(c) => (c.size, c.mtime_ms, Some(c.cid.clone()), c.doc_id.clone()),
+        Some(c) => (c.size, c.mtime_ms, Some(c.cid().to_string()), c.doc_id.clone()),
         None => (0, 0, None, None),
     };
     Entry {
@@ -447,6 +464,9 @@ impl DriveServer {
                 | DriveOp::Move { .. }
                 | DriveOp::Copy { .. }
                 | DriveOp::Delete { .. }
+                | DriveOp::SetProp { .. }
+                | DriveOp::Tag { .. }
+                | DriveOp::Link { .. }
         );
         let out = match req.op {
             DriveOp::Open => self.op_open(&drive_id, chain).await,
@@ -468,6 +488,18 @@ impl DriveServer {
             }
             DriveOp::Poll { cursor, limit } => self.op_poll(&drive_id, cursor, limit).await,
             DriveOp::Watch => self.op_watch(&drive_id).await,
+            DriveOp::Meta { path } => self.op_meta(&drive_id, &path).await,
+            DriveOp::SetProp { path, key, value } => {
+                self.op_set_prop(&drive_id, &path, &key, value).await
+            }
+            DriveOp::Tag { path, tag, remove } => {
+                self.op_tag(&drive_id, &path, &tag, remove).await
+            }
+            DriveOp::Link { path, rel, to, remove } => {
+                self.op_link(&drive_id, &path, &rel, &to, remove).await
+            }
+            DriveOp::Backlinks { to } => self.op_backlinks(&drive_id, &to).await,
+            DriveOp::Versions { path } => self.op_versions(&drive_id, &path).await,
         };
         // Persist BEFORE replying, so a client that got an ok has a durable write.
         if mutates && out.is_ok() {
@@ -573,7 +605,7 @@ impl DriveServer {
             let t = reg.get(drive_id).ok_or(DriveErr::NotFound)?;
             let node = t.drive.tree().resolve(&norm_path(path)).ok_or(DriveErr::NotFound)?;
             let content = t.drive.content().get(&node).ok_or(DriveErr::NotFound)?;
-            content.cid.clone()
+            content.cid().to_string()
         };
         // Fetch the manifest and compute the intersecting chunks.
         let manifest_bytes = self
@@ -669,7 +701,8 @@ impl DriveServer {
             let t = reg.get_mut(drive_id).ok_or(DriveErr::NotFound)?;
             let src = t.drive.tree().resolve(&norm_path(from)).ok_or(DriveErr::NotFound)?;
             let content = t.drive.content().get(&src).cloned().ok_or(DriveErr::NotFound)?;
-            let fc = ce_drive_core::FileContent::new(content.cid, content.size, content.mode, now_ms());
+            let fc =
+                ce_drive_core::FileContent::new(content.locator, content.size, content.mode, now_ms());
             let node_id = t
                 .drive
                 .add_file(&to_parent, &to_name, fc)
@@ -793,6 +826,110 @@ impl DriveServer {
         Ok(DriveOk::Watching { topic: changes_topic(drive_id), cursor })
     }
 
+    // ----- metadata -----
+    //
+    // These verbs existed in ce-drive-core but never reached this wire, which made them a LOCAL CLI
+    // feature: they could not replicate, no second device could see them, and nothing indexing the
+    // drive could read them. `props.kind` in particular is what tells a reader which parser a file
+    // wants, and links are the cross-app edges — both are worth far more over the mesh than on one
+    // disk.
+
+    async fn op_meta(&self, drive_id: &str, path: &str) -> Result<DriveOk, DriveErr> {
+        let reg = self.registry.lock().await;
+        let t = reg.get(drive_id).ok_or(DriveErr::NotFound)?;
+        let node = t.drive.tree().resolve(&norm_path(path)).ok_or(DriveErr::NotFound)?;
+        let meta = t.drive.meta_of(&norm_path(path)).map_err(|e| DriveErr::Internal(e.to_string()))?;
+        let (props, tags, links) = match meta {
+            // A node with no metadata is not an error: it is a file nobody has said anything about.
+            None => (Vec::new(), Vec::new(), Vec::new()),
+            Some(m) => (
+                m.props.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                m.tags.iter().cloned().collect(),
+                m.links
+                    .iter()
+                    .map(|(rel, to)| crate::wire::MetaLink { rel: rel.clone(), to: to.key() })
+                    .collect(),
+            ),
+        };
+        Ok(DriveOk::Meta { node_id: node, props, tags, links })
+    }
+
+    async fn op_set_prop(
+        &self,
+        drive_id: &str,
+        path: &str,
+        key: &str,
+        value: Option<String>,
+    ) -> Result<DriveOk, DriveErr> {
+        let mut reg = self.registry.lock().await;
+        let t = reg.get_mut(drive_id).ok_or(DriveErr::NotFound)?;
+        let p = norm_path(path);
+        match value {
+            Some(v) => t.drive.set_prop(&p, key, &v),
+            None => t.drive.unset_prop(&p, key),
+        }
+        .map_err(|e| DriveErr::Internal(e.to_string()))?;
+        Ok(DriveOk::Deleted)
+    }
+
+    async fn op_tag(
+        &self,
+        drive_id: &str,
+        path: &str,
+        tag: &str,
+        remove: bool,
+    ) -> Result<DriveOk, DriveErr> {
+        let mut reg = self.registry.lock().await;
+        let t = reg.get_mut(drive_id).ok_or(DriveErr::NotFound)?;
+        let p = norm_path(path);
+        if remove { t.drive.remove_tag(&p, tag) } else { t.drive.add_tag(&p, tag) }
+            .map_err(|e| DriveErr::Internal(e.to_string()))?;
+        Ok(DriveOk::Deleted)
+    }
+
+    async fn op_link(
+        &self,
+        drive_id: &str,
+        path: &str,
+        rel: &str,
+        to: &str,
+        remove: bool,
+    ) -> Result<DriveOk, DriveErr> {
+        let mut reg = self.registry.lock().await;
+        let t = reg.get_mut(drive_id).ok_or(DriveErr::NotFound)?;
+        let p = norm_path(path);
+        let target = ce_drive_core::meta::LinkTarget::parse(to);
+        if remove { t.drive.unlink(&p, rel, target) } else { t.drive.link(&p, rel, target) }
+            .map_err(|e| DriveErr::Internal(e.to_string()))?;
+        Ok(DriveOk::Deleted)
+    }
+
+    async fn op_backlinks(&self, drive_id: &str, to: &str) -> Result<DriveOk, DriveErr> {
+        let reg = self.registry.lock().await;
+        let t = reg.get(drive_id).ok_or(DriveErr::NotFound)?;
+        let target = ce_drive_core::meta::LinkTarget::parse(to);
+        let links = t.drive.meta().backlinks(&target);
+        Ok(DriveOk::Backlinks { links })
+    }
+
+    async fn op_versions(&self, drive_id: &str, path: &str) -> Result<DriveOk, DriveErr> {
+        let reg = self.registry.lock().await;
+        let t = reg.get(drive_id).ok_or(DriveErr::NotFound)?;
+        let node = t.drive.tree().resolve(&norm_path(path)).ok_or(DriveErr::NotFound)?;
+        let content = t.drive.content().get(&node).ok_or(DriveErr::NotFound)?;
+        let versions = content
+            .versions
+            .iter()
+            .map(|v| crate::wire::VersionInfo {
+                set_at_ms: v.set_at_ms,
+                locator: v.locator.display(),
+                size: v.size,
+                conflict: v.conflict,
+            })
+            .collect();
+        Ok(DriveOk::Versions { versions })
+    }
+
     // ----- helpers -----
 
     /// Publish a best-effort change beacon (a hint; `Poll` is the truth).
@@ -828,7 +965,7 @@ fn stat_entry(drive: &ce_drive_core::Drive, path: &str) -> Option<Entry> {
     let edge = drive.tree().edge(&node)?;
     let is_dir = matches!(edge.kind, NodeKind::Dir);
     let (size, mtime_ms, object_cid, doc_id) = match drive.content().get(&node) {
-        Some(c) => (c.size, c.mtime_ms, Some(c.cid.clone()), c.doc_id.clone()),
+        Some(c) => (c.size, c.mtime_ms, Some(c.cid().to_string()), c.doc_id.clone()),
         None => (0, 0, None, None),
     };
     Some(Entry {

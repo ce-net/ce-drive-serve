@@ -61,6 +61,23 @@ pub enum DriveOp {
     Poll { cursor: Option<u64>, limit: u32 },
     /// Returns the pubsub beacon topic + the client's current cursor.
     Watch,
+    /// Read a path's metadata: props, tags and typed links.
+    ///
+    /// Metadata has existed in `ce-drive-core` since props/tags/links landed, but never reached
+    /// this wire — so it was a LOCAL CLI feature that could not replicate and no second device could
+    /// see. That also made it invisible to anything indexing the drive: `props.kind` is what tells a
+    /// reader which parser a file wants, and links are the cross-app edges.
+    Meta { path: String },
+    /// Set or clear one prop. `value: None` clears it.
+    SetProp { path: String, key: String, value: Option<String> },
+    /// Add or remove one tag.
+    Tag { path: String, tag: String, remove: bool },
+    /// Add or remove one typed link. `to` is `node:<id>`, `cid:<hash>`, or any other string (a URI).
+    Link { path: String, rel: String, to: String, remove: bool },
+    /// Everything linking TO a target, as `(rel, node id)`.
+    Backlinks { to: String },
+    /// A file's version history, newest last.
+    Versions { path: String },
 }
 
 /// The caveats a [`DriveOp::Share`] attaches to the minted sub-capability.
@@ -114,6 +131,32 @@ pub enum DriveOk {
     Shared { chain: String },
     Changes { changes: Vec<Change>, new_cursor: u64 },
     Watching { topic: String, cursor: u64 },
+    /// A node's metadata. `node_id` is included because links are stored against the stable id, not
+    /// the path — an indexer that keys on the path would break on the first rename.
+    Meta { node_id: String, props: Vec<(String, String)>, tags: Vec<String>, links: Vec<MetaLink> },
+    /// `(rel, source node id)` pairs pointing at the requested target.
+    Backlinks { links: Vec<(String, String)> },
+    /// Version history for a file, oldest first.
+    Versions { versions: Vec<VersionInfo> },
+}
+
+/// One typed outgoing edge, rendered for the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetaLink {
+    pub rel: String,
+    /// `node:<id>`, `cid:<hash>` or a URI — the same grammar the CLI accepts.
+    pub to: String,
+}
+
+/// One historical content pointer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionInfo {
+    pub set_at_ms: u64,
+    /// `<app>:<id>` — which content app holds these bytes, and its handle for them.
+    pub locator: String,
+    pub size: u64,
+    /// True if this version was a genuine concurrent edit that lost LWW.
+    pub conflict: bool,
 }
 
 /// One directory entry.
