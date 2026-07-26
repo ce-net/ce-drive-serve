@@ -45,13 +45,19 @@ ce-node = { git = "https://github.com/ce-net/ce" }
 # (client -> serve) does not affect the normal build graph (Cargo permits dev-dep cycles).
 ce-drive-client = { git = "https://github.com/ce-net/ce-drive-client" }
 
-# ce-coord and rdev (pulled transitively via ce-drive-core) depend on ce-rs / ce-cap by GIT; redirect
-# those git URLs onto the local path copies so the whole graph collapses onto ONE ce-rs (one CeClient,
-# one data::Manifest, one cid) and ONE ce-cap. Same trick ce-drive's own workspace uses.
-[patch."https://github.com/ce-net/ce-rs"]
-ce-rs = { git = "https://github.com/ce-net/ce-rs" }
-
-[patch."https://github.com/ce-net/ce"]
-ce-cap = { git = "https://github.com/ce-net/ce" }
-ce-container = { git = "https://github.com/ce-net/ce" }
-ce-identity = { git = "https://github.com/ce-net/ce" }
+# NO [patch] SECTION, DELIBERATELY — do not reintroduce one.
+#
+# ce-coord and rdev (pulled transitively via ce-drive-core) reach ce-rs / ce-identity by GIT, and the
+# whole graph must collapse onto ONE ce-rs (one CeClient, one data::Manifest, one cid) so those types
+# stay identical across crates. Back when the deps above were `path = "../ce-rs"`, that unification
+# needed a [patch] redirecting the git URL onto the path copy.
+#
+# The deps are git deps on the SAME URLs now, so cargo unifies them on its own and the patch is
+# obsolete. Worse than obsolete: the sweep that converted the deps rewrote the patch VALUES too, so
+# each entry patched a source to ITSELF and cargo refuses the manifest outright —
+#   error: patch for `ce-cap` points to the same source, but patches must point to different sources
+# which made this repo unbuildable from a clean checkout while still building here, because
+# `tools/ce-dev-link` writes a .cargo/config.toml whose real path patches masked it.
+#
+# Local development still gets working-tree sources: that is exactly what ce-dev-link's generated,
+# git-excluded .cargo/config.toml is for. It belongs there and NOT here, because it is per-machine.

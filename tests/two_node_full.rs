@@ -65,7 +65,8 @@ async fn start_node(bootstrap: Option<String>, dir: &Path) -> anyhow::Result<(No
         bootstrap_peers: bootstrap.into_iter().collect(),
         data_dir: dir.to_path_buf(),
         api_port: api,
-        mine: false,
+        // (`mine: false` used to sit here. The economy was extracted from the node in 2026-07 and
+        // every node is chain-free now, so the field is gone — there is nothing left to turn off.)
         disable_local_discovery: true,
         ephemeral: true,
         ..Default::default()
