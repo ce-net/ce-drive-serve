@@ -170,3 +170,86 @@ async fn a_drive_survives_a_restart() {
     assert_eq!(entries.len(), 1, "the file survived the restart");
     assert_eq!(entries[0].name, "report.md");
 }
+
+/// THE PROPERTY (d) EXISTS FOR: a crash between snapshots loses nothing.
+///
+/// Writes used to be made durable by rewriting the whole drive after every op. They are now made
+/// durable by the write-ahead journal, and the whole-drive snapshot only runs on a timer. That is a
+/// straight win on write cost -- and it would be a straight data-loss bug if the journal were not
+/// actually replayed. So: write, never snapshot, restart, and require the writes back.
+#[tokio::test(flavor = "multi_thread")]
+async fn writes_survive_a_crash_with_no_snapshot_at_all() {
+    let Some((_node, key_dir, coord)) = coord_or_skip("crash").await else { return };
+    let jpath = tmpdir("crash-journal").join("team.cejournal");
+
+    // --- a host takes writes and dies. No .cedrive is ever written. ---
+    {
+        let mut reg = Registry::new(&key_dir).unwrap();
+        reg.create(&coord, "team", Quota::default(), &[]).await.unwrap();
+        reg.attach_journal("team", &jpath).unwrap();
+        let t = reg.get_mut("team").unwrap();
+        t.drive.mkdir("/", "docs").await.unwrap();
+        t.drive
+            .add_file("/docs", "urgent.md", FileContent::new("cid-urgent", 9, 0o644, 3))
+            .await
+            .unwrap();
+        t.drive.set_prop("/docs/urgent.md", "kind", "ocean-doc").await.unwrap();
+        // and the process is gone -- no snapshot, no clean shutdown, nothing else written.
+    }
+
+    // --- it comes back with an empty drive and only the journal to go on ---
+    let Some((_node2, key_dir2, coord2)) = coord_or_skip("crash-restart").await else { return };
+    let mut reg = Registry::new(&key_dir2).unwrap();
+    reg.create(&coord2, "team", Quota::default(), &[]).await.unwrap();
+    let (applied, replay) = reg.attach_journal("team", &jpath).unwrap();
+
+    assert_eq!(replay.torn_bytes, 0, "a clean journal, since this crash was between ops");
+    assert!(replay.records >= 3, "every op reached the journal, got {}", replay.records);
+    assert!(applied.moves >= 2 && applied.contents >= 1 && applied.metas >= 1);
+
+    let t = reg.get("team").unwrap();
+    let entries = t.drive.ls("/docs").unwrap();
+    assert_eq!(entries.len(), 1, "the file is back");
+    assert_eq!(entries[0].name, "urgent.md");
+    let content = t.drive.content_of(&entries[0].node_id).expect("its bytes are bound again");
+    assert_eq!(content.cid(), "cid-urgent");
+    // Metadata too -- it is a separate collection and a separate journal record type, so it is
+    // entirely possible to recover the tree and silently lose every tag, prop and link.
+    let meta = t.drive.meta_of(&entries[0].node_id).expect("its metadata is back");
+    assert_eq!(meta.props.get("kind").map(String::as_str), Some("ocean-doc"));
+}
+
+/// A journal that has been snapshotted away must not replay -- and must not be lost either.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_journal_replays_nothing_but_the_snapshot_still_has_it() {
+    let Some((_node, key_dir, coord)) = coord_or_skip("reset").await else { return };
+    let dir = tmpdir("reset-state");
+    let jpath = dir.join("team.cejournal");
+    let spath = dir.join("team.cedrive");
+
+    let state = {
+        let mut reg = Registry::new(&key_dir).unwrap();
+        reg.create(&coord, "team", Quota::default(), &[]).await.unwrap();
+        reg.attach_journal("team", &jpath).unwrap();
+        let t = reg.get_mut("team").unwrap();
+        t.drive.mkdir("/", "docs").await.unwrap();
+        let state = t.drive.to_state();
+        // What the durability tick does: snapshot, THEN reset. Never the other way round.
+        persist::save(&spath, &state).unwrap();
+        t.drive.journal().unwrap().reset().unwrap();
+        state
+    };
+
+    let (recs, _) = ce_drive_core::journal::replay(&jpath).unwrap();
+    assert!(recs.is_empty(), "the journal was emptied by the reset");
+
+    let Some((_node2, key_dir2, coord2)) = coord_or_skip("reset-restart").await else { return };
+    let mut reg = Registry::new(&key_dir2).unwrap();
+    reg.restore(&coord2, "team", state, Quota::default(), &[]).await.unwrap();
+    let (_, replay) = reg.attach_journal("team", &jpath).unwrap();
+    assert_eq!(replay.records, 0, "nothing to replay");
+    assert!(
+        reg.get("team").unwrap().drive.resolve("/docs").is_some(),
+        "and the snapshot carried the work the journal gave up"
+    );
+}

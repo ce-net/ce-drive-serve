@@ -11,7 +11,7 @@ use ce_drive_serve::{DriveServer, Quota, Registry};
 use ce_identity::Identity;
 use ce_rs::CeClient;
 use clap::Parser;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(name = "ce-drive-serve", about = "Host CE drives over the mesh, gated by ce-cap")]
@@ -100,13 +100,23 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("create {}", state_dir.display()))?;
 
-    // Peers and the coordinator come FIRST, because a drive is a replica set from the moment it
-    // opens. Building it single-writer and joining afterwards is what created two representations of
-    // the same drive.
-    let peers = discover_peers(&client, &args.peers).await;
+    // SERVE FIRST, DISCOVER AFTER. Peer discovery used to run here, before anything was serving,
+    // and a drive is not allowed to depend on the DHT to answer a local read.
+    //
+    // This host went completely dark for it. On a node whose DHT was degraded -- the bootstrap
+    // relay had run out of disk -- `find_service` took 35 seconds to time out, and until it did,
+    // the process had not subscribed to anything: alive, healthy to `ce app ps`, writing its
+    // journal on schedule, and answering nothing. Every app that waits on the drive looked broken
+    // too, so the fault appeared to be everywhere except where it was.
+    //
+    // Peers are still discovered, on a background task, and added to each drive's replica set as
+    // they are found (`add_writer` is idempotent). A drive with no peers yet is a drive serving its
+    // own data, which is exactly what it should be doing while it looks for company.
     let coord = ce_coord::Coord::with_client(client.clone())
         .await
         .context("open ce-coord (a drive is a replicated log; there is no single-writer mode)")?;
+    // Only what the operator passed explicitly: known without asking anyone.
+    let peers: Vec<String> = args.peers.clone();
 
     let mut registry = Registry::new(&key_dir)?;
     for d in &args.drives {
@@ -126,10 +136,34 @@ async fn main() -> Result<()> {
                       "serving drive (new — no state file yet)");
             }
         }
+
+        // The journal goes on top of the snapshot, and only after it: the snapshot is the drive as
+        // of the last periodic write, the journal is every op accepted since. This is the half of
+        // durability that survives a crash -- the snapshot alone would lose up to a minute of
+        // acknowledged writes.
+        let jpath = state_dir.join(format!("{d}.cejournal"));
+        let (applied, replay) = registry
+            .attach_journal(d, &jpath)
+            .with_context(|| format!("attach journal {}", jpath.display()))?;
+        if replay.records > 0 || replay.torn_bytes > 0 {
+            info!(drive = %d, path = %jpath.display(), records = replay.records,
+                  moves = applied.moves, contents = applied.contents, metas = applied.metas,
+                  torn_bytes = replay.torn_bytes,
+                  "replayed the write-ahead journal on top of the snapshot");
+        }
+        if replay.torn_bytes > 0 {
+            // Normal after an unclean shutdown, and worth saying out loud: it means the process
+            // died mid-append, and the op in that torn record was never acknowledged to a client.
+            warn!(drive = %d, torn_bytes = replay.torn_bytes,
+                  "the journal had a torn tail (the last append did not complete); everything \
+                   before it was recovered");
+        }
     }
 
     let server = DriveServer::new(client.clone(), registry, &key_dir, Vec::new())?
         .with_state_dir(&state_dir);
+    // Now that the drives are open and about to serve, go looking for the rest of the replica set.
+    spawn_peer_discovery(client.clone(), server.registry(), args.drives.clone());
     server.announce().await?;
     if let Some(name) = &args.name {
         if let Err(e) = client.claim_name(name).await {
@@ -143,29 +177,56 @@ async fn main() -> Result<()> {
     server.run(args.poll_ms).await
 }
 
-/// Everyone else advertising `ce-drive` — the replica set assembles itself.
+/// Find the rest of the replica set, in the background, forever.
 ///
-/// PEERS COME FROM DISCOVERY, always, with no flag to enable it. Replicating across devices is the
-/// JOB of this app, not a mode: a drive that syncs only when configured to is a local folder with
-/// extra steps, and every flag is one more thing an operator (or an AI wiring up infrastructure) has
-/// to know before the system behaves correctly. `--peer` only ADDS to what was found, for a node the
-/// DHT cannot see.
+/// PEERS COME FROM DISCOVERY, always, with no flag to enable it: replicating across devices is this
+/// app's job, not a mode. `--peer` only ADDS to what is found, for a node the DHT cannot see.
 ///
-/// Ourselves excluded: a writer does not follow its own log. Discovery failure is not fatal — a host
-/// that refused to start because the mesh was unreachable would be strictly worse than one that
-/// serves what it has and picks peers up later.
-async fn discover_peers(client: &CeClient, extra: &[String]) -> Vec<String> {
-    let mut peers: Vec<String> = extra.to_vec();
-    match client.find_service("ce-drive").await {
-        Ok(found) => {
-            let me = client.status().await.map(|s| s.node_id).unwrap_or_default();
-            for p in found {
-                if p != me && !peers.contains(&p) {
-                    peers.push(p);
+/// OFF THE BOOT PATH, though. Discovery is a DHT query against peers that may be slow, unreachable
+/// or out of disk, and a host that waits for it before subscribing is a host that disappears
+/// whenever the network is having a bad day -- which is precisely when its data is most wanted.
+/// So the server is already serving when this starts, and every peer found is added to the live
+/// drives with `add_writer`, which is idempotent.
+///
+/// It keeps looking rather than sweeping once: a device that joins the drive tomorrow is exactly as
+/// much a member as one that was up at boot, and requiring a restart to notice it would make the
+/// replica set a function of who happened to be awake first.
+fn spawn_peer_discovery(
+    client: CeClient,
+    registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
+    drives: Vec<String>,
+) {
+    tokio::spawn(async move {
+        let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let me = client.status().await.map(|s| s.node_id).unwrap_or_default();
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            let found = match client.find_service("ce-drive").await {
+                Ok(f) => f,
+                // Not an error worth shouting about: a DHT that cannot answer right now means the
+                // replica set is smaller than it will be, not that anything is wrong here.
+                Err(e) => {
+                    debug!(error = %e, "drive peers: discovery unavailable; retrying");
+                    continue;
+                }
+            };
+            for peer in found {
+                if peer == me || !known.insert(peer.clone()) {
+                    continue;
+                }
+                let reg = registry.lock().await;
+                for d in &drives {
+                    if let Some(t) = reg.get(d) {
+                        match t.drive.add_writer(&peer).await {
+                            Ok(()) => info!(drive = %d, peer = %peer,
+                                            "drive peers: following a newly discovered writer"),
+                            Err(e) => warn!(drive = %d, peer = %peer, error = %e,
+                                            "drive peers: could not follow"),
+                        }
+                    }
                 }
             }
         }
-        Err(e) => warn!(error = %e, "drive peers: discovery failed; starting with --peer only"),
-    }
-    peers
+    });
 }

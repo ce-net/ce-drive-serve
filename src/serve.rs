@@ -300,26 +300,17 @@ impl DriveServer {
         self.state_dir.as_ref().map(|d| d.join(format!("{drive_id}.cedrive")))
     }
 
-    /// Write one drive's state to disk. Called after every mutating op that succeeded.
+    /// Write one drive's whole state to disk, and reset its journal now that the journal's contents
+    /// are folded into that snapshot.
     ///
-    /// A drive that accepted a write and then failed to record it is the failure this whole module
-    /// exists to prevent, so a persist error is surfaced to the caller rather than logged and
-    /// swallowed — the client needs to know the write is not durable.
-    async fn persist(&self, drive_id: &str) -> Result<(), DriveErr> {
+    /// PERIODIC, not per-op: this is O(drive), which is exactly why it is off the request path. It
+    /// bounds how much the journal has to replay at boot; it is NOT what makes a write durable --
+    /// the journal already did that, before the op was applied.
+    pub async fn snapshot(&self, drive_id: &str) -> Result<(), DriveErr> {
         let Some(path) = self.state_path(drive_id) else { return Ok(()) };
-        let state = {
-            let reg = self.registry.lock().await;
-            let Some(t) = reg.get(drive_id) else { return Ok(()) };
-            t.drive.to_state()
-        };
-        ce_drive_core::persist::save(&path, &state).map_err(|e| {
-            tracing::error!(drive = %drive_id, path = %path.display(), error = %e,
-                            "DURABILITY FAILURE: drive mutated but state could not be written");
-            DriveErr::Internal(format!(
-                "write applied in memory but could not be persisted to {}: {e}",
-                path.display()
-            ))
-        })
+        snapshot_drive(&self.registry, &path, drive_id)
+            .await
+            .map_err(|e| DriveErr::Internal(e.to_string()))
     }
 
     /// The registry handle (for tests / admin to create drives + push content).
@@ -336,6 +327,11 @@ impl DriveServer {
         // contract for a different audience: ce.index looks for a corpus, not for a drive host. A
         // consumer that wanted one and found the other would have to guess which envelope to speak.
         let _ = self.client.advertise_service(crate::corpus::ITEMS_SERVICE).await;
+        // Subscribe here too, so the first request after boot is not missed while the serve loop is
+        // still opening its stream. `run` re-subscribes on every reconnect; this is the first one.
+        for topic in [crate::wire::DRIVE_TOPIC, crate::corpus::ITEMS_TOPIC] {
+            let _ = self.client.subscribe(topic).await;
+        }
         Ok(())
     }
 
@@ -350,9 +346,22 @@ impl DriveServer {
     pub async fn run(&self, reconnect_ms: u64) -> Result<()> {
         use futures_util::StreamExt;
         info!(host = %hex::encode(self.host_id), "ce-drive serve loop started (push stream)");
-        spawn_checkpointer(self.registry.clone());
+        spawn_durability(self.registry.clone(), self.state_dir.clone());
         let mut seen: HashSet<u64> = HashSet::new();
         loop {
+            // RE-SUBSCRIBE ON EVERY (RE)CONNECT, before reading anything.
+            //
+            // Subscribing once at startup is not enough and the failure is silent: when the stream
+            // breaks -- a node restart, a loaded machine, a half-open socket -- this loop used to
+            // reconnect and read from a node that no longer had us down as a subscriber. The
+            // process stays up, stays healthy, keeps writing its journal on schedule, and answers
+            // nothing. `ce_rs::serve` learned this same lesson; this loop is hand-rolled and did
+            // not inherit it.
+            for topic in [crate::wire::DRIVE_TOPIC, crate::corpus::ITEMS_TOPIC] {
+                if let Err(e) = self.client.subscribe(topic).await {
+                    debug!(topic = %topic, error = %e, "drive: re-subscribe failed; retrying");
+                }
+            }
             // Catch anything buffered in the inbox while we were (re)connecting.
             if let Ok(msgs) = self.client.messages().await {
                 for m in msgs {
@@ -602,19 +611,6 @@ impl DriveServer {
         req: DriveReq,
     ) -> Result<DriveOk, DriveErr> {
         let drive_id = req.drive.clone();
-        // Whether this op can change persisted DriveState. Share is excluded deliberately: it mints
-        // a capability, it does not touch the tree or the content map.
-        let mutates = matches!(
-            req.op,
-            DriveOp::Write { .. }
-                | DriveOp::Mkdir { .. }
-                | DriveOp::Move { .. }
-                | DriveOp::Copy { .. }
-                | DriveOp::Delete { .. }
-                | DriveOp::SetProp { .. }
-                | DriveOp::Tag { .. }
-                | DriveOp::Link { .. }
-        );
         let out = match req.op {
             DriveOp::Open => self.op_open(&drive_id, chain).await,
             DriveOp::Stat { path } => self.op_stat(&drive_id, &path).await,
@@ -648,10 +644,14 @@ impl DriveServer {
             DriveOp::Backlinks { to } => self.op_backlinks(&drive_id, &to).await,
             DriveOp::Versions { path } => self.op_versions(&drive_id, &path).await,
         };
-        // Persist BEFORE replying, so a client that got an ok has a durable write.
-        if mutates && out.is_ok() {
-            self.persist(&drive_id).await?;
-        }
+        // No persist step here, deliberately.
+        //
+        // This used to serialize, compress and rewrite the ENTIRE drive before replying, so adding
+        // one file to a drive of fifty thousand rewrote all fifty thousand -- the cost of a write
+        // grew with everything ever written. Durability now comes from the write-ahead journal,
+        // which fsynced this op BEFORE it was applied (see `ce_drive_core::journal`). By the time a
+        // handler returns Ok the write is already on disk, so a client holding an ok still holds a
+        // durable write -- it just cost O(op) instead of O(drive).
         out
     }
 
@@ -1096,40 +1096,94 @@ impl DriveServer {
     }
 }
 
-/// How often a hosted drive checkpoints itself, in seconds.
+/// How often a hosted drive snapshots itself and resets its journal, in seconds.
 ///
-/// Long, deliberately: a checkpoint serializes the whole of this device's writer logs, and the
-/// per-op `.cedrive` write is what makes a write durable. This is the other half — the one that
-/// makes it durable somewhere OTHER than this disk.
-const CHECKPOINT_SECS: u64 = 300;
+/// This is a bound on BOOT time, not on durability: every op is already fsynced to the journal
+/// before it is applied, so a shorter interval buys nothing but a shorter replay. Too short and a
+/// busy drive spends its life rewriting itself; a minute keeps replay trivial and the rewrite rare.
+const SNAPSHOT_SECS: u64 = 60;
 
-/// Periodically store each hosted drive through the mesh's own content-addressed store.
+/// Checkpoint (compact the writer logs into content-addressed objects) every N snapshot ticks.
 ///
-/// The drive uses the same primitive it exists to serve: `SyncedDrive::checkpoint` serializes this
-/// device's tree, content and metadata writer logs to content-addressed objects and compacts the
-/// local logs past them. Two things follow, and both matter more than the disk write does:
+/// Rarer than a snapshot because it is the more expensive of the two and answers a different
+/// question: a snapshot is about THIS host restarting, a checkpoint is about another device joining
+/// cheaply and about the state existing somewhere other than this disk.
+const CHECKPOINT_EVERY: u32 = 5;
+
+/// Write one drive's whole state to `path`, then reset its journal.
 ///
-///  - a device joining the drive bootstraps from the checkpoint instead of replaying every op from
-///    version 1, which is the difference between a long-lived drive opening instantly and opening in
-///    minutes;
-///  - the record is a CID, so it is fetchable from any node that has it. The `.cedrive` file is
-///    durable only as long as THIS disk is.
+/// Snapshot first, reset second, always. A crash between the two replays a handful of ops the
+/// snapshot already holds — harmless, because every drive op is a timestamped CRDT op and therefore
+/// idempotent. The other order has a window where the ops are in neither place, which is data loss.
+async fn snapshot_drive(
+    registry: &Arc<Mutex<Registry>>,
+    path: &std::path::Path,
+    drive_id: &str,
+) -> Result<()> {
+    let state = {
+        let reg = registry.lock().await;
+        let Some(t) = reg.get(drive_id) else { return Ok(()) };
+        t.drive.to_state()
+    };
+    if let Err(e) = ce_drive_core::persist::save(path, &state) {
+        tracing::error!(drive = %drive_id, path = %path.display(), error = %e,
+                        "drive snapshot failed; the journal still holds every op since the last \
+                         good one, so nothing is lost -- but it will grow until this succeeds");
+        return Err(e);
+    }
+    let reg = registry.lock().await;
+    if let Some(t) = reg.get(drive_id) {
+        if let Some(j) = t.drive.journal() {
+            if let Err(e) = j.reset() {
+                warn!(drive = %drive_id, error = %e,
+                      "journal reset failed after a good snapshot; it will replay ops the snapshot \
+                       already holds, which is wasteful but not wrong");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The durability task: snapshot each drive periodically, and checkpoint it into the mesh's own
+/// content-addressed store less often.
 ///
-/// It runs on its own task rather than inline after each write because a checkpoint is O(history)
-/// and a write must stay O(1). Failures are logged and retried on the next tick: a checkpoint is a
-/// compaction, never the thing that makes a write durable, so a failed one must not fail an op.
-fn spawn_checkpointer(registry: Arc<Mutex<Registry>>) {
+/// Both are off the request path because both are O(drive) and a write must stay O(op). Neither is
+/// what makes a write durable — `ce_drive_core::journal` does that, synchronously, before the op is
+/// applied. These two bound how much the journal has to replay, and put the state somewhere other
+/// than this one disk:
+///
+///  - the SNAPSHOT is `<drive>.cedrive`, the same file the ce-drive CLI reads, and is what this host
+///    boots from;
+///  - the CHECKPOINT serializes this device's writer logs to content-addressed objects and compacts
+///    the logs past them, so a device joining an old drive bootstraps from a CID instead of
+///    replaying from version 1 — and the record is fetchable from any node that has it, unlike a
+///    file, which is durable exactly as long as its disk is.
+///
+/// Failures are logged and retried on the next tick. A failed snapshot means the journal keeps
+/// growing, which is visible and survivable; failing an op because a background compaction failed
+/// would not be.
+fn spawn_durability(registry: Arc<Mutex<Registry>>, state_dir: Option<std::path::PathBuf>) {
     tokio::spawn(async move {
-        let mut tick =
-            tokio::time::interval(std::time::Duration::from_secs(CHECKPOINT_SECS));
-        tick.tick().await; // the first tick is immediate; a fresh drive has nothing to compact
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(SNAPSHOT_SECS));
+        tick.tick().await; // the first tick fires immediately; a fresh drive has nothing to write
+        let mut n: u32 = 0;
         loop {
             tick.tick().await;
+            n = n.wrapping_add(1);
             let ids = { registry.lock().await.drive_ids() };
             for id in ids {
-                // The lock is held across the checkpoint, which serializes it against writes on
-                // this host. That is the same discipline every mutating op already follows, and a
-                // checkpoint racing its own log is the one thing that would corrupt it.
+                if let Some(dir) = &state_dir {
+                    let path = dir.join(format!("{id}.cedrive"));
+                    if let Err(e) = snapshot_drive(&registry, &path, &id).await {
+                        warn!(drive = %id, error = %e, "snapshot failed; retrying next tick");
+                    }
+                }
+                if n % CHECKPOINT_EVERY != 0 {
+                    continue;
+                }
+                // The registry lock is held across the checkpoint, which serializes it against
+                // writes on this host. That is deliberate: a checkpoint racing its own log is the
+                // one thing that would corrupt it.
                 let reg = registry.lock().await;
                 let Some(t) = reg.get(&id) else { continue };
                 match t.drive.checkpoint().await {
@@ -1138,7 +1192,7 @@ fn spawn_checkpointer(registry: Arc<Mutex<Registry>>) {
                         "drive checkpointed to content-addressed objects"
                     ),
                     Err(e) => warn!(drive = %id, error = %e,
-                                    "drive checkpoint failed; retrying next tick"),
+                                    "drive checkpoint failed; retrying next cycle"),
                 }
             }
         }

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 use ce_coord::Coord;
-use ce_drive_core::{DriveState, SyncedDrive, Workspace};
+use ce_drive_core::{journal, DriveState, Journal, SyncedDrive, Workspace};
 use ce_identity::Identity;
 
 use crate::feed::Feed;
@@ -129,6 +129,32 @@ impl Registry {
                 .await?;
         self.drives.insert(drive_id.to_string(), tenant);
         Ok(())
+    }
+
+    /// Make `drive_id` durable through the journal at `path`, replaying whatever is already in it.
+    ///
+    /// Call this AFTER `create`/`restore`, because the journal sits on top of the snapshot: the
+    /// snapshot is the drive as of the last periodic write, the journal is every op since. Replaying
+    /// it in the other order would apply old ops over newer state -- which the CRDT timestamps would
+    /// survive, but only by accident, and a boot path should not depend on that.
+    ///
+    /// Returns what was replayed. A non-empty report is the normal shape of an unclean shutdown; a
+    /// non-zero `torn_bytes` means the process died mid-append, which the format is built to
+    /// survive and which is worth logging rather than hiding.
+    pub fn attach_journal(
+        &mut self,
+        drive_id: &str,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(ce_drive_core::sync::AdoptReport, journal::ReplayReport)> {
+        let path = path.as_ref();
+        let (recs, replay) = journal::replay(path)?;
+        let t = self
+            .drives
+            .get_mut(drive_id)
+            .ok_or_else(|| anyhow::anyhow!("no such drive '{drive_id}'"))?;
+        let applied = t.drive.restore_journal(recs)?;
+        t.drive.attach_journal(Journal::open(path)?);
+        Ok((applied, replay))
     }
 
     /// Borrow a drive by id.
