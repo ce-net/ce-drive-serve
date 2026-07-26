@@ -350,6 +350,7 @@ impl DriveServer {
     pub async fn run(&self, reconnect_ms: u64) -> Result<()> {
         use futures_util::StreamExt;
         info!(host = %hex::encode(self.host_id), "ce-drive serve loop started (push stream)");
+        spawn_checkpointer(self.registry.clone());
         let mut seen: HashSet<u64> = HashSet::new();
         loop {
             // Catch anything buffered in the inbox while we were (re)connecting.
@@ -1093,6 +1094,55 @@ impl DriveServer {
     fn host_identity(&self) -> Result<Identity> {
         Identity::load_or_generate(&self.key_dir)
     }
+}
+
+/// How often a hosted drive checkpoints itself, in seconds.
+///
+/// Long, deliberately: a checkpoint serializes the whole of this device's writer logs, and the
+/// per-op `.cedrive` write is what makes a write durable. This is the other half — the one that
+/// makes it durable somewhere OTHER than this disk.
+const CHECKPOINT_SECS: u64 = 300;
+
+/// Periodically store each hosted drive through the mesh's own content-addressed store.
+///
+/// The drive uses the same primitive it exists to serve: `SyncedDrive::checkpoint` serializes this
+/// device's tree, content and metadata writer logs to content-addressed objects and compacts the
+/// local logs past them. Two things follow, and both matter more than the disk write does:
+///
+///  - a device joining the drive bootstraps from the checkpoint instead of replaying every op from
+///    version 1, which is the difference between a long-lived drive opening instantly and opening in
+///    minutes;
+///  - the record is a CID, so it is fetchable from any node that has it. The `.cedrive` file is
+///    durable only as long as THIS disk is.
+///
+/// It runs on its own task rather than inline after each write because a checkpoint is O(history)
+/// and a write must stay O(1). Failures are logged and retried on the next tick: a checkpoint is a
+/// compaction, never the thing that makes a write durable, so a failed one must not fail an op.
+fn spawn_checkpointer(registry: Arc<Mutex<Registry>>) {
+    tokio::spawn(async move {
+        let mut tick =
+            tokio::time::interval(std::time::Duration::from_secs(CHECKPOINT_SECS));
+        tick.tick().await; // the first tick is immediate; a fresh drive has nothing to compact
+        loop {
+            tick.tick().await;
+            let ids = { registry.lock().await.drive_ids() };
+            for id in ids {
+                // The lock is held across the checkpoint, which serializes it against writes on
+                // this host. That is the same discipline every mutating op already follows, and a
+                // checkpoint racing its own log is the one thing that would corrupt it.
+                let reg = registry.lock().await;
+                let Some(t) = reg.get(&id) else { continue };
+                match t.drive.checkpoint().await {
+                    Ok((tree, content, meta)) => info!(
+                        drive = %id, tree = %tree.cid, content = %content.cid, meta = %meta.cid,
+                        "drive checkpointed to content-addressed objects"
+                    ),
+                    Err(e) => warn!(drive = %id, error = %e,
+                                    "drive checkpoint failed; retrying next tick"),
+                }
+            }
+        }
+    });
 }
 
 /// Stat a path to a wire [`Entry`] (file or dir). Returns `None` if the path doesn't resolve.
