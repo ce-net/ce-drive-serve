@@ -26,6 +26,7 @@ use ce_rs::{CeClient, data};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+use crate::corpus::decode_content_reply;
 use crate::tenant::Registry;
 use crate::wire::{
     Beacon, ChangeKind, ChunkRef, DriveErr, DriveOk, DriveOp, DriveReply, DriveReq, Entry,
@@ -331,6 +332,10 @@ impl DriveServer {
     pub async fn announce(&self) -> Result<()> {
         // Advertise we host drives (best-effort).
         let _ = self.client.advertise_service("ce-drive").await;
+        // The corpus surface is advertised SEPARATELY, under its own name, because it is a different
+        // contract for a different audience: ce.index looks for a corpus, not for a drive host. A
+        // consumer that wanted one and found the other would have to guess which envelope to speak.
+        let _ = self.client.advertise_service(crate::corpus::ITEMS_SERVICE).await;
         Ok(())
     }
 
@@ -462,43 +467,68 @@ impl DriveServer {
         })
     }
 
-    /// Fetch a node's bytes and route them to its kind app.
+    /// Fetch a node's bytes from whichever content app holds them, and route them to its kind app.
     ///
-    /// Every failure degrades to `unextracted` rather than propagating: an unknown kind, an
-    /// uninstalled app, an unreachable content app or a malformed reply must all leave the node
-    /// indexed on what the drive knows, because one bad format cannot be allowed to stop a drive
-    /// being searchable.
+    /// Both halves resolve BY SERVICE NAME: a locator's `app` names the content app, and
+    /// `props.kind` names the kind app. Neither is a registry lookup and neither is hardcoded, which
+    /// is what lets a new filesystem or a new format be nothing but a new app.
+    ///
+    /// Every failure degrades to `unextracted` rather than propagating — an unknown kind, an
+    /// uninstalled app, an unreachable content app, an oversized file or a malformed reply must all
+    /// leave the node indexed on what the drive knows. One bad format cannot stop a drive being
+    /// searchable.
     async fn extract_node(&self, f: &crate::corpus::NodeFacts) -> crate::corpus::Extracted {
         let Some(kind) = f.kind.as_deref().filter(|k| !k.is_empty()) else {
-            return crate::corpus::Extracted::unextracted();
-        };
-        // Only blob-held bytes can be fetched from here today; any other content app is reached
-        // through its own service and is not yet wired, so it degrades honestly rather than lying.
-        let Some(cid) = f.locator.strip_prefix("blob:") else {
             return crate::corpus::Extracted::unextracted();
         };
         if f.size > crate::corpus::EXTRACT_MAX_BYTES {
             return crate::corpus::Extracted::unextracted();
         }
-        let Ok(bytes) = self.client.get_object(cid).await else {
+        let Some(bytes) = self.fetch_content(f).await else {
             return crate::corpus::Extracted::unextracted();
         };
         let name = f.path.rsplit('/').next().unwrap_or("");
-        let req = crate::corpus::extract_request(&bytes, name);
-        let Ok(body) = serde_json::to_vec(&req) else {
+        let Ok(body) = serde_json::to_vec(&crate::corpus::extract_request(&bytes, name)) else {
             return crate::corpus::Extracted::unextracted();
         };
-        // The kind app is found BY ITS OWN SERVICE NAME — props.kind IS that name. No registry.
-        let Ok(providers) = self.client.find_service(kind).await else {
-            return crate::corpus::Extracted::unextracted();
-        };
-        let Some(to) = providers.first() else {
-            return crate::corpus::Extracted::unextracted();
-        };
-        match self.client.request(to, &format!("{kind}/ctl"), &body, 15_000).await {
-            Ok(raw) => crate::corpus::extract_reply(&raw),
-            Err(_) => crate::corpus::Extracted::unextracted(),
+        match self.call_app(kind, &body).await {
+            Some(raw) => crate::corpus::extract_reply(&raw),
+            None => crate::corpus::Extracted::unextracted(),
         }
+    }
+
+    /// Read a node's bytes from the content app named in its locator.
+    ///
+    /// `blob` gets a shortcut to the node's own object store — not a special case for that app, but
+    /// because those bytes are already local and content-addressed, so a mesh round trip to read
+    /// what is on this disk would be pure latency. The app is still tried first, so a drive whose
+    /// blobs live on another node works; the shortcut only rescues the case where `ce-blobs` is not
+    /// installed but the bytes are here anyway.
+    async fn fetch_content(&self, f: &crate::corpus::NodeFacts) -> Option<Vec<u8>> {
+        let (app, id) = f.locator.split_once(':')?;
+        if app.is_empty() || id.is_empty() {
+            return None;
+        }
+        let req = serde_json::json!({"op": "get", "args": {"id": id}});
+        if let Ok(body) = serde_json::to_vec(&req) {
+            if let Some(raw) = self.call_app(app, &body).await {
+                if let Some(bytes) = decode_content_reply(&raw) {
+                    return Some(bytes);
+                }
+            }
+        }
+        if app == "blob" {
+            return self.client.get_object(id).await.ok();
+        }
+        None
+    }
+
+    /// One JSON-envelope request to an app found by SERVICE NAME. `None` on any failure, because
+    /// every caller here degrades rather than propagating.
+    async fn call_app(&self, service: &str, body: &[u8]) -> Option<Vec<u8>> {
+        let providers = self.client.find_service(service).await.ok()?;
+        let to = providers.first()?;
+        self.client.request(to, &format!("{service}/ctl"), body, 15_000).await.ok()
     }
 
     /// Decode + dispatch one request and send the reply.

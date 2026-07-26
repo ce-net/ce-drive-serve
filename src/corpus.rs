@@ -487,3 +487,35 @@ mod mouth_tests {
         assert_eq!(e["error"], "boom");
     }
 }
+
+/// Read a content app's `get` reply into bytes.
+///
+/// Content apps answer the JSON envelope with base64, so this is where a `local-fs` file, a `blob`
+/// object and a `stream` window all become the same `Vec<u8>` — which is exactly the uniformity the
+/// contract exists to buy.
+pub fn decode_content_reply(raw: &[u8]) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let b64 = v.get("result")?.get("base64")?.as_str()?;
+    base64::engine::general_purpose::STANDARD.decode(b64).ok()
+}
+
+#[cfg(test)]
+mod content_reply_tests {
+    use super::*;
+
+    #[test]
+    fn every_content_app_decodes_the_same_way() {
+        // blob, local-fs and stream all answer with base64 in the same envelope; the router must not
+        // care which one replied.
+        let raw = br#"{"ok":true,"result":{"id":"x","base64":"aGVsbG8="}}"#;
+        assert_eq!(decode_content_reply(raw).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn a_refusal_yields_no_bytes_rather_than_empty_ones() {
+        // An error must not look like a zero-length file, or the index would record it as empty.
+        assert!(decode_content_reply(br#"{"error":"no such stream"}"#).is_none());
+        assert!(decode_content_reply(b"not json").is_none());
+    }
+}
