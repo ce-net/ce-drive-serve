@@ -373,7 +373,11 @@ impl DriveServer {
     /// Filter, dedup, and dispatch one inbound app message (shared by the inbox drain + the stream).
     async fn handle_inbound(&self, m: &ce_rs::AppMessage, seen: &mut HashSet<u64>) {
         let Some(token) = m.reply_token else { return };
-        if m.topic != crate::wire::DRIVE_TOPIC {
+        // Two audiences, two envelopes: bincode `ce-drive/v1` for drive clients, and the plain
+        // JSON corpus contract for ce.index. Making the index learn bincode would have been the
+        // coupling all over again.
+        let is_items = m.topic == crate::corpus::ITEMS_TOPIC;
+        if m.topic != crate::wire::DRIVE_TOPIC && !is_items {
             return;
         }
         if !seen.insert(token) {
@@ -383,8 +387,117 @@ impl DriveServer {
             seen.clear();
             seen.insert(token);
         }
-        if let Err(e) = self.handle_message(token, &m.from, &m.payload_hex).await {
+        let res = if is_items {
+            self.handle_items(token, &m.payload_hex).await
+        } else {
+            self.handle_message(token, &m.from, &m.payload_hex).await
+        };
+        if let Err(e) = res {
             warn!(error = %e, "ce-drive request handling failed");
+        }
+    }
+
+    /// Answer the corpus contract: `{"op":"items","args":{drive?,path?,offset?,limit?}}`.
+    ///
+    /// This is the router routing. Per node: read what the drive knows, resolve the bytes through
+    /// the content app that holds them, hand those bytes to the kind app named by `props.kind`, and
+    /// assemble an item. No format is read here and no search is run — it dispatches.
+    async fn handle_items(&self, token: u64, payload_hex: &str) -> Result<()> {
+        let payload = hex::decode(payload_hex)?;
+        let reply = match serde_json::from_slice::<serde_json::Value>(&payload) {
+            Err(e) => crate::corpus::err_reply(&format!("request is not JSON: {e}")),
+            Ok(v) => match v.get("op").and_then(|o| o.as_str()).unwrap_or("") {
+                "describe" | "ping" => crate::corpus::ok_reply(serde_json::json!({
+                    "service": crate::corpus::ITEMS_SERVICE,
+                    "topic": crate::corpus::ITEMS_TOPIC,
+                    "summary": "ce-drive's corpus surface: every node as an indexable item, keyed by \
+                                stable node id, with content extracted by the kind app named in \
+                                props.kind. ce-drive routes; it does not read formats or search.",
+                    "ops": {"items": {"drive": "optional", "path": "/", "offset": 0, "limit": 50}},
+                    "drives": self.registry.lock().await.drive_ids(),
+                })),
+                "items" => self.op_items(&crate::corpus::ItemsArgs::parse(&v)).await,
+                other => crate::corpus::err_reply(&format!("unknown op: {other} (see describe)")),
+            },
+        };
+        self.client.reply(token, &reply).await?;
+        Ok(())
+    }
+
+    /// One page of the corpus.
+    async fn op_items(&self, args: &crate::corpus::ItemsArgs) -> Vec<u8> {
+        let drive_id = match &args.drive {
+            Some(d) => d.clone(),
+            None => match self.registry.lock().await.drive_ids().first() {
+                Some(d) => d.clone(),
+                None => return crate::corpus::err_reply("this host serves no drives"),
+            },
+        };
+
+        // Collect the facts under one lock, then release it: extraction does mesh I/O per node and
+        // holding the registry across it would stall every other op on the drive.
+        let facts = {
+            let reg = self.registry.lock().await;
+            let Some(t) = reg.get(&drive_id) else {
+                return crate::corpus::err_reply(&format!("no such drive: {drive_id}"));
+            };
+            crate::corpus::walk_facts(&t.drive, &norm_path(&args.path))
+        };
+
+        let total = facts.len();
+        let page: Vec<_> = facts.into_iter().skip(args.offset).take(args.limit).collect();
+        let mut items = Vec::with_capacity(page.len());
+        for f in page {
+            let extracted = self.extract_node(&f).await;
+            items.push(crate::corpus::item_from(&f, &extracted));
+        }
+        let next = args.offset + items.len();
+        let more = next < total;
+        crate::corpus::ok_reply(crate::corpus::ItemsPage {
+            drive: drive_id,
+            returned: items.len(),
+            items,
+            cursor: if more { Some(next) } else { None },
+            more,
+        })
+    }
+
+    /// Fetch a node's bytes and route them to its kind app.
+    ///
+    /// Every failure degrades to `unextracted` rather than propagating: an unknown kind, an
+    /// uninstalled app, an unreachable content app or a malformed reply must all leave the node
+    /// indexed on what the drive knows, because one bad format cannot be allowed to stop a drive
+    /// being searchable.
+    async fn extract_node(&self, f: &crate::corpus::NodeFacts) -> crate::corpus::Extracted {
+        let Some(kind) = f.kind.as_deref().filter(|k| !k.is_empty()) else {
+            return crate::corpus::Extracted::unextracted();
+        };
+        // Only blob-held bytes can be fetched from here today; any other content app is reached
+        // through its own service and is not yet wired, so it degrades honestly rather than lying.
+        let Some(cid) = f.locator.strip_prefix("blob:") else {
+            return crate::corpus::Extracted::unextracted();
+        };
+        if f.size > crate::corpus::EXTRACT_MAX_BYTES {
+            return crate::corpus::Extracted::unextracted();
+        }
+        let Ok(bytes) = self.client.get_object(cid).await else {
+            return crate::corpus::Extracted::unextracted();
+        };
+        let name = f.path.rsplit('/').next().unwrap_or("");
+        let req = crate::corpus::extract_request(&bytes, name);
+        let Ok(body) = serde_json::to_vec(&req) else {
+            return crate::corpus::Extracted::unextracted();
+        };
+        // The kind app is found BY ITS OWN SERVICE NAME — props.kind IS that name. No registry.
+        let Ok(providers) = self.client.find_service(kind).await else {
+            return crate::corpus::Extracted::unextracted();
+        };
+        let Some(to) = providers.first() else {
+            return crate::corpus::Extracted::unextracted();
+        };
+        match self.client.request(to, &format!("{kind}/ctl"), &body, 15_000).await {
+            Ok(raw) => crate::corpus::extract_reply(&raw),
+            Err(_) => crate::corpus::Extracted::unextracted(),
         }
     }
 

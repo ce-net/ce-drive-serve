@@ -334,3 +334,156 @@ mod tests {
         assert_eq!(req["args"]["base64"], "aGVsbG8=");
     }
 }
+
+// =================================================================================================
+// The mesh face: `ce-drive/items`, the JSON envelope every ce app speaks.
+// =================================================================================================
+
+/// Every file node under `path`, as facts the router can act on.
+///
+/// Directories are skipped: they have no bytes and nothing to extract, and their names are already
+/// carried in every child's `path` and `dir`.
+pub fn walk_facts(drive: &ce_drive_core::Drive, path: &str) -> Vec<NodeFacts> {
+    let mut out = Vec::new();
+    let mut stack = vec![path.to_string()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = drive.ls(&dir) else { continue };
+        for e in entries {
+            let child = if dir == "/" {
+                format!("/{}", e.name)
+            } else {
+                format!("{dir}/{}", e.name)
+            };
+            if e.is_dir {
+                stack.push(child);
+                continue;
+            }
+            let Some(content) = e.content.as_ref() else { continue };
+            let meta = drive.meta_of(&child).ok().flatten();
+            let (props, tags, links) = match meta {
+                None => (BTreeMap::new(), Vec::new(), Vec::new()),
+                Some(m) => (
+                    m.props.clone(),
+                    m.tags.iter().cloned().collect(),
+                    m.links.iter().map(|(rel, to)| (rel.clone(), to.key())).collect(),
+                ),
+            };
+            out.push(NodeFacts {
+                node_id: e.node_id.clone(),
+                path: child,
+                size: content.size,
+                mtime_ms: content.mtime_ms,
+                // props.kind IS the service name of the app that understands this format.
+                kind: props.get(crate::corpus::KIND_PROP).cloned(),
+                locator: content.locator.display(),
+                tags,
+                links,
+                props,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+/// The conventional prop naming a node's format, mirrored from `ce_drive_core::kind_apps`.
+pub const KIND_PROP: &str = "kind";
+
+/// The topic ce-drive answers the corpus contract on.
+///
+/// A separate topic from `ce-drive/v1` because this is a different audience with a different
+/// envelope: `ce-drive/v1` is bincode between drive clients, while the corpus contract is the plain
+/// JSON envelope every script-tier app (and ce.index) already speaks. Making ce-index learn bincode
+/// to read a corpus would have been the coupling all over again.
+pub const ITEMS_TOPIC: &str = "ce-drive/items";
+
+/// Refuse to pull more than this into memory to extract one node. A drive holds videos and disk
+/// images; indexing must not try to read them whole. Oversized content degrades to `unextracted`
+/// and stays findable by name, path, tags and links.
+pub const EXTRACT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The corpus service name, advertised so ce.index can find it without an address.
+pub const ITEMS_SERVICE: &str = "ce-drive.corpus";
+
+/// One page of the corpus.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ItemsPage {
+    pub drive: String,
+    pub items: Vec<Item>,
+    /// Offset to resume from, or absent when the walk is complete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<usize>,
+    pub more: bool,
+    pub returned: usize,
+}
+
+/// Parse an `items` request: `{"op":"items","args":{drive?,path?,offset?,limit?}}`.
+#[derive(Debug, Clone, Default)]
+pub struct ItemsArgs {
+    pub drive: Option<String>,
+    pub path: String,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+impl ItemsArgs {
+    /// Bounded by construction: a caller asking for the world still gets a page, because an
+    /// unbounded reply is the failure mode that already bit Ocean (a 3.8 MB reply took 19s then
+    /// timed out entirely, while the same bytes in 200 KB pages moved in 600ms).
+    pub const MAX_LIMIT: usize = 200;
+
+    pub fn parse(v: &serde_json::Value) -> ItemsArgs {
+        let a = v.get("args").unwrap_or(&serde_json::Value::Null);
+        ItemsArgs {
+            drive: a.get("drive").and_then(|d| d.as_str()).map(str::to_string),
+            path: a.get("path").and_then(|p| p.as_str()).unwrap_or("/").to_string(),
+            offset: a.get("offset").and_then(|o| o.as_u64()).unwrap_or(0) as usize,
+            limit: (a.get("limit").and_then(|l| l.as_u64()).unwrap_or(50) as usize)
+                .clamp(1, Self::MAX_LIMIT),
+        }
+    }
+}
+
+/// The JSON reply envelope: `{"ok":true,"result":...}`.
+pub fn ok_reply(result: impl Serialize) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({"ok": true, "result": result}))
+        .unwrap_or_else(|_| b"{\"error\":\"encode failed\"}".to_vec())
+}
+
+/// The JSON error envelope.
+pub fn err_reply(msg: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({"error": msg}))
+        .unwrap_or_else(|_| b"{\"error\":\"encode failed\"}".to_vec())
+}
+
+#[cfg(test)]
+mod mouth_tests {
+    use super::*;
+
+    #[test]
+    fn a_page_is_always_bounded() {
+        // "give me everything" must still come back as a page.
+        let v = serde_json::json!({"op":"items","args":{"limit": 100000}});
+        assert_eq!(ItemsArgs::parse(&v).limit, ItemsArgs::MAX_LIMIT);
+        let v = serde_json::json!({"op":"items","args":{"limit": 0}});
+        assert_eq!(ItemsArgs::parse(&v).limit, 1);
+    }
+
+    #[test]
+    fn defaults_walk_the_whole_drive_from_the_start() {
+        let a = ItemsArgs::parse(&serde_json::json!({"op":"items"}));
+        assert_eq!(a.path, "/");
+        assert_eq!(a.offset, 0);
+        assert!(a.drive.is_none());
+    }
+
+    #[test]
+    fn replies_use_the_envelope_every_ce_app_speaks() {
+        let raw = ok_reply(serde_json::json!({"x": 1}));
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["x"], 1);
+        let e: serde_json::Value = serde_json::from_slice(&err_reply("boom")).unwrap();
+        assert_eq!(e["error"], "boom");
+    }
+}
