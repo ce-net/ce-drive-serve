@@ -18,12 +18,14 @@
 //! Edition 2024, `anyhow::Result`, `tracing` (no `println!` in the library), no `unsafe`, no
 //! `unwrap()` on production paths. Money is `ce-rs::Amount` base units — decimal strings on the wire.
 
+pub mod corpus;
 pub mod feed;
 pub mod serve;
 pub mod tenant;
 pub mod wire;
 
 pub use serve::{DriveServer, authorize_req, drive_caveat_prefix, read_plan, required_ability};
+pub use corpus::{Extracted, Item, NodeFacts, extract_reply, extract_request, item_from};
 pub use tenant::{Registry, Tenant};
 pub use wire::{
     Beacon, Change, ChangeKind, ChunkRef, DriveErr, DriveOk, DriveOp, DriveReply, DriveReq, Entry,
