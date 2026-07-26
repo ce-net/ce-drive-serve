@@ -196,10 +196,13 @@ class _Dec:
 # DriveOp variant indices, in declaration order.
 OP_OPEN, OP_STAT, OP_LIST, OP_READ, OP_WRITE, OP_MKDIR = 0, 1, 2, 3, 4, 5
 OP_MOVE, OP_COPY, OP_DELETE, OP_SHARE, OP_POLL, OP_WATCH = 6, 7, 8, 9, 10, 11
+# Appended after Watch, so every index above is untouched and no deployed client's wire moves.
+OP_META, OP_SETPROP, OP_TAG, OP_LINK, OP_BACKLINKS, OP_VERSIONS = 12, 13, 14, 15, 16, 17
 
 # DriveOk variant indices, in declaration order.
 OK_OPENED, OK_ENTRY, OK_LISTING, OK_READPLAN, OK_WRITTEN = 0, 1, 2, 3, 4
 OK_MADE, OK_DELETED, OK_SHARED, OK_CHANGES, OK_WATCHING = 5, 6, 7, 8, 9
+OK_META, OK_BACKLINKS, OK_VERSIONS = 10, 11, 12
 
 # DriveErr variant index -> (code, message). Mirrors DriveErr::code()/Display.
 _ERRS = {
@@ -256,6 +259,28 @@ class ReadPlan:
     chunks: list = field(default_factory=list)
     encrypted: bool = False
     key_hint: Optional[str] = None
+
+
+@dataclass
+class Meta:
+    """A node's props, tags and typed links.
+
+    Keyed by `node_id`, not by path: links are stored against the stable id, so a rename never
+    breaks an edge. Anything indexing the drive should key on `node_id` for the same reason.
+    `props["kind"]` is the conventional one — it says what a file IS, which is what lets a reader
+    pick a parser for it."""
+    node_id: str
+    props: dict = field(default_factory=dict)
+    tags: list = field(default_factory=list)
+    links: list = field(default_factory=list)   # [(rel, target)]
+
+
+@dataclass
+class Version:
+    set_at_ms: int
+    locator: str            # "<app>:<id>" — which content app holds these bytes
+    size: int
+    conflict: bool = False
 
 
 @dataclass
@@ -351,6 +376,17 @@ def _dec_reply(payload: bytes):
         return (d.seq(lambda: _dec_change(d)), d.u64())
     if ok == OK_WATCHING:
         return {"topic": d.str(), "cursor": d.u64()}
+    if ok == OK_META:
+        node_id = d.str()
+        props = dict(d.seq(lambda: (d.str(), d.str())))
+        tags = d.seq(d.str)
+        links = d.seq(lambda: (d.str(), d.str()))
+        return Meta(node_id=node_id, props=props, tags=tags, links=links)
+    if ok == OK_BACKLINKS:
+        return d.seq(lambda: (d.str(), d.str()))
+    if ok == OK_VERSIONS:
+        return d.seq(lambda: Version(set_at_ms=d.u64(), locator=d.str(), size=d.u64(),
+                                     conflict=d.bool()))
     raise DriveError(f"unknown DriveOk variant {ok} (host is newer than this SDK)")
 
 
@@ -551,6 +587,37 @@ class Drive:
         """The pubsub beacon topic + your current cursor. The beacon is a
         best-effort wake-up hint (gossip is lossy by design); on wake, `poll()`."""
         return self._call(OP_WATCH)
+
+    # ---- metadata: props, tags, typed links ----
+    #
+    # These reach the mesh, so a tag set here replicates and anything indexing the drive can read
+    # it. They were core-only for a while, which made them a single-machine feature.
+
+    def meta(self, path: str) -> Meta:
+        """A path's props, tags and links. A node nobody has annotated returns empty sets."""
+        return self._call(OP_META, lambda e: e.str(path))
+
+    def set_prop(self, path: str, key: str, value) -> bool:
+        """Set a prop, or clear it by passing None. `kind` is the conventional one."""
+        return self._call(
+            OP_SETPROP, lambda e: e.str(path).str(key).opt_str(value))
+
+    def tag(self, path: str, tag: str, remove: bool = False) -> bool:
+        return self._call(OP_TAG, lambda e: e.str(path).str(tag).bool(remove))
+
+    def link(self, path: str, to: str, rel: str = "related", remove: bool = False) -> bool:
+        """Link a path to a target under a relation. `to` is `node:<id>`, `cid:<hash>` or a URI;
+        a `node:` link survives the target being renamed or moved."""
+        return self._call(
+            OP_LINK, lambda e: e.str(path).str(rel).str(to).bool(remove))
+
+    def backlinks(self, to: str):
+        """Everything linking TO a target, as (rel, node_id) pairs."""
+        return self._call(OP_BACKLINKS, lambda e: e.str(to))
+
+    def versions(self, path: str):
+        """A file's version history, oldest first."""
+        return self._call(OP_VERSIONS, lambda e: e.str(path))
 
     # ---- bytes: the blob layer, never the metadata channel ----
 

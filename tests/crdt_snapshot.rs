@@ -36,7 +36,7 @@ fn walk(drive: &Drive, path: &str, out: &mut Vec<String>) {
         let tag = if e.is_dir {
             format!("D {child}")
         } else {
-            let cid = e.content.as_ref().map(|c| c.cid.clone()).unwrap_or_default();
+            let cid = e.content.as_ref().map(|c| c.cid().to_string()).unwrap_or_default();
             format!("F {child} {cid}")
         };
         out.push(tag);

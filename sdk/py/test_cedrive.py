@@ -55,6 +55,11 @@ GOLDEN_REQS = {
     "poll": (REQ_PREFIX + "0a000000" + "01" + "0700000000000000" + "f4010000"),
     # Watch
     "watch": REQ_PREFIX + "0b000000",
+    # Meta { path: "/a" }
+    "meta": REQ_PREFIX + "0c000000" + "0200000000000000" + "2f61",
+    # Tag { path: "/a", tag: "x", remove: true }
+    "tag": (REQ_PREFIX + "0e000000" + "0200000000000000" + "2f61"
+            + "0100000000000000" + "78" + "01"),
     # Share { path: "/p", audience: "aud", abilities: ["read"],
     #         caveats: { not_after: 1, max_bytes_read: None, max_bytes_write: Some(2) } }
     "share": (REQ_PREFIX + "09000000"
@@ -192,6 +197,21 @@ class TestGoldenRequests(unittest.TestCase):
             (e.str("/p").str("aud").seq_str(["read"])
              .u64(1).opt_u64(None).opt_u64(2))
         self.assertEqual(enc(cedrive.OP_SHARE, w), GOLDEN_REQS["share"])
+
+    def test_metadata_ops(self):
+        self.assertEqual(enc(cedrive.OP_META, lambda e: e.str("/a")), GOLDEN_REQS["meta"])
+        self.assertEqual(
+            enc(cedrive.OP_TAG, lambda e: e.str("/a").str("x").bool(True)),
+            GOLDEN_REQS["tag"])
+
+    def test_metadata_variants_were_APPENDED_not_inserted(self):
+        """Inserting a variant anywhere but the end silently repoints every later op for every
+        deployed client. Metadata had to land after Watch for exactly that reason."""
+        self.assertEqual(cedrive.OP_WATCH, 11, "Watch must stay the last pre-metadata op")
+        self.assertEqual(
+            [cedrive.OP_META, cedrive.OP_SETPROP, cedrive.OP_TAG,
+             cedrive.OP_LINK, cedrive.OP_BACKLINKS, cedrive.OP_VERSIONS],
+            [12, 13, 14, 15, 16, 17])
 
     def test_variant_indices_match_declaration_order(self):
         """The discriminant IS the declaration order in wire.rs. Inserting a

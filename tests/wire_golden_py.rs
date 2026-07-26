@@ -129,6 +129,20 @@ fn golden_poll_and_watch() {
 }
 
 #[test]
+fn golden_metadata_ops() {
+    // Metadata was APPENDED after Watch. Inserting anywhere else would silently repoint every later
+    // op for every deployed client, which no round-trip test can catch.
+    assert_eq!(
+        req(DriveOp::Meta { path: "/a".into() }),
+        golden(&["0c000000", "0200000000000000", "2f61"].concat())
+    );
+    assert_eq!(
+        req(DriveOp::Tag { path: "/a".into(), tag: "x".into(), remove: true }),
+        golden(&["0e000000", "0200000000000000", "2f61", "0100000000000000", "78", "01"].concat())
+    );
+}
+
+#[test]
 fn golden_share_caveats_field_order() {
     assert_eq!(
         req(DriveOp::Share {
@@ -240,6 +254,17 @@ fn variant_indices_are_declaration_order() {
         },
         DriveOp::Poll { cursor: None, limit: 0 },
         DriveOp::Watch,
+        DriveOp::Meta { path: String::new() },
+        DriveOp::SetProp { path: String::new(), key: String::new(), value: None },
+        DriveOp::Tag { path: String::new(), tag: String::new(), remove: false },
+        DriveOp::Link {
+            path: String::new(),
+            rel: String::new(),
+            to: String::new(),
+            remove: false,
+        },
+        DriveOp::Backlinks { to: String::new() },
+        DriveOp::Versions { path: String::new() },
     ];
     for (want, op) in ops.into_iter().enumerate() {
         let encoded = req(op);
