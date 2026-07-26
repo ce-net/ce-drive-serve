@@ -20,7 +20,8 @@ path = "src/main.rs"
 ce-rs = { git = "https://github.com/ce-net/ce-rs" }                            # mesh transport (request/reply/publish) + blobs
 ce-iam-core = { git = "https://github.com/ce-net/ce-iam" }
 ce-identity = { git = "https://github.com/ce-net/ce" }     # Ed25519 identity (the drive host = the cap root)
-ce-drive-core = { git = "https://github.com/ce-net/ce-drive" } # DriveTree CRDT + content map + share vocab
+ce-drive-core = { git = "https://github.com/ce-net/ce-drive" }  # DriveTree CRDT + content map + share vocab
+ce-coord = { git = "https://github.com/ce-net/ce-coord" }       # SyncedDrive rides its Merged writer logs
 
 # --- async + error + serde ---
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }

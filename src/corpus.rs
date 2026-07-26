@@ -424,6 +424,18 @@ pub struct ItemsArgs {
     pub path: String,
     pub offset: usize,
     pub limit: usize,
+    /// Only nodes modified at or after this unix second.
+    ///
+    /// THE STEADY-STATE CRAWL DEPENDS ON THIS. ce.index passes back the newest `updated` it has
+    /// seen, so a routine re-crawl costs only what actually changed. Ignoring it is *allowed* --
+    /// the contract says correctness never depends on an app honouring `since` -- but on a drive of
+    /// any size ignoring it means re-reading and re-extracting every file on every pass, which is
+    /// rebuilding the index from scratch forever.
+    ///
+    /// Filtering happens BEFORE pagination, deliberately: filtering a page after slicing it would
+    /// make `offset` mean "position in the unfiltered walk", so a caller paging through changes
+    /// would skip real results.
+    pub since: u64,
 }
 
 impl ItemsArgs {
@@ -440,6 +452,7 @@ impl ItemsArgs {
             offset: a.get("offset").and_then(|o| o.as_u64()).unwrap_or(0) as usize,
             limit: (a.get("limit").and_then(|l| l.as_u64()).unwrap_or(50) as usize)
                 .clamp(1, Self::MAX_LIMIT),
+            since: a.get("since").and_then(|s| s.as_u64()).unwrap_or(0),
         }
     }
 }
@@ -456,9 +469,51 @@ pub fn err_reply(msg: &str) -> Vec<u8> {
         .unwrap_or_else(|_| b"{\"error\":\"encode failed\"}".to_vec())
 }
 
+/// Keep only what changed at or after `since`. `since == 0` keeps everything (a first crawl).
+pub fn changed_since(facts: Vec<NodeFacts>, since: u64) -> Vec<NodeFacts> {
+    if since == 0 {
+        return facts;
+    }
+    facts.into_iter().filter(|f| f.mtime_ms / 1000 >= since).collect()
+}
+
 #[cfg(test)]
 mod mouth_tests {
     use super::*;
+
+    #[test]
+    fn since_zero_is_a_full_crawl() {
+        let f = vec![NodeFacts { mtime_ms: 1_000, ..Default::default() }];
+        assert_eq!(changed_since(f, 0).len(), 1);
+    }
+
+    #[test]
+    fn since_keeps_only_what_changed() {
+        // The steady-state crawl: ce.index passes the newest `updated` it holds, and a routine pass
+        // costs only what actually moved. Without this, every crawl re-reads and re-extracts the
+        // whole drive — rebuilding the index from scratch, forever.
+        let facts = vec![
+            NodeFacts { path: "/old".into(), mtime_ms: 1_000_000, ..Default::default() },
+            NodeFacts { path: "/new".into(), mtime_ms: 5_000_000, ..Default::default() },
+        ];
+        let kept = changed_since(facts, 2_000);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].path, "/new");
+    }
+
+    #[test]
+    fn since_is_inclusive_so_a_resumed_crawl_cannot_skip_a_tie() {
+        // Two nodes written in the same second as the cursor must not fall through the gap.
+        let facts = vec![NodeFacts { path: "/edge".into(), mtime_ms: 3_000_000, ..Default::default() }];
+        assert_eq!(changed_since(facts, 3_000).len(), 1, "at the boundary it must be kept");
+    }
+
+    #[test]
+    fn since_is_parsed_from_the_request() {
+        let v = serde_json::json!({"op":"items","args":{"since": 1700000000}});
+        assert_eq!(ItemsArgs::parse(&v).since, 1_700_000_000);
+        assert_eq!(ItemsArgs::parse(&serde_json::json!({"op":"items"})).since, 0);
+    }
 
     #[test]
     fn a_page_is_always_bounded() {

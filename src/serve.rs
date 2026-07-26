@@ -449,6 +449,9 @@ impl DriveServer {
             crate::corpus::walk_facts(&t.drive, &norm_path(&args.path))
         };
 
+        // Filter BEFORE paginating: filtering a page after slicing would make `offset` mean
+        // "position in the unfiltered walk", so a caller paging through changes would skip results.
+        let facts = crate::corpus::changed_since(facts, args.since);
         let total = facts.len();
         let page: Vec<_> = facts.into_iter().skip(args.offset).take(args.limit).collect();
         let mut items = Vec::with_capacity(page.len());
