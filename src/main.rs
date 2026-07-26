@@ -26,6 +26,11 @@ struct Args {
     /// `identity/` subdir.
     #[arg(long)]
     key_dir: Option<PathBuf>,
+    /// Directory holding `<drive>.cedrive` state files. Defaults to `$CE_DRIVE_DIR`, else the
+    /// platform data dir + `ce-drive` — the same place the `ce-drive` CLI keeps them, so the host
+    /// serves the drive that actually holds your files rather than a fresh empty one.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
     /// Drive ids to create and serve (repeatable).
     #[arg(long = "drive", default_values_t = vec!["default".to_string()])]
     drives: Vec<String>,
@@ -35,6 +40,22 @@ struct Args {
     /// Poll interval for the serve loop, in milliseconds.
     #[arg(long, default_value_t = 200)]
     poll_ms: u64,
+}
+
+/// Where `<drive>.cedrive` files live.
+///
+/// This MUST agree with `ce-drive`'s own `Paths::resolve` — `$CE_DRIVE_DIR`, else the platform data
+/// dir plus `ce-drive`. The host and the CLI have to open the same files or there are two drives
+/// with the same name: a local one holding everyone's work and a mesh one that is empty. That is
+/// exactly the state this host shipped in.
+fn default_state_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("CE_DRIVE_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    Ok(directories::ProjectDirs::from("", "", "ce-drive")
+        .context("cannot resolve the CE drive data dir")?
+        .data_dir()
+        .to_path_buf())
 }
 
 fn default_key_dir() -> Result<PathBuf> {
@@ -64,13 +85,35 @@ async fn main() -> Result<()> {
 
     let client = CeClient::with_token(&args.api, args.token.or_else(ce_rs::discover_api_token));
 
+    let state_dir = match args.state_dir {
+        Some(d) => d,
+        None => default_state_dir()?,
+    };
+    std::fs::create_dir_all(&state_dir)
+        .with_context(|| format!("create {}", state_dir.display()))?;
+
     let mut registry = Registry::new(&key_dir)?;
     for d in &args.drives {
-        registry.create(d, Quota::default())?;
-        info!(drive = %d, "serving drive");
+        let path = state_dir.join(format!("{d}.cedrive"));
+        // LOAD, don't create. A `create` here is what made every hosted drive empty and amnesiac:
+        // it silently shadowed the real state file sitting right next to it.
+        match ce_drive_core::persist::load(&path)? {
+            Some(state) => {
+                let files = state.content_log.len();
+                registry.restore(d, state, Quota::default())?;
+                info!(drive = %d, path = %path.display(), content_ops = files,
+                      "serving drive (resumed from disk)");
+            }
+            None => {
+                registry.create(d, Quota::default())?;
+                info!(drive = %d, path = %path.display(),
+                      "serving drive (new — no state file yet)");
+            }
+        }
     }
 
-    let server = DriveServer::new(client.clone(), registry, &key_dir, Vec::new())?;
+    let server = DriveServer::new(client.clone(), registry, &key_dir, Vec::new())?
+        .with_state_dir(&state_dir);
     server.announce().await?;
     if let Some(name) = &args.name {
         if let Err(e) = client.claim_name(name).await {

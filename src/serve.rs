@@ -240,6 +240,11 @@ pub struct DriveServer {
     host_id: NodeId,
     accepted_roots: Vec<NodeId>,
     key_dir: std::path::PathBuf,
+    /// Where `<drive>.cedrive` files live. `None` means **in-memory only**: the drive is rebuilt
+    /// empty on every boot and every write is lost on restart. That was the only behaviour this
+    /// host had, and it is why the drive published on the mesh was not the drive anyone's files
+    /// were in. Set it (see `with_state_dir`) to make a hosted drive durable.
+    state_dir: Option<std::path::PathBuf>,
 }
 
 impl DriveServer {
@@ -260,6 +265,42 @@ impl DriveServer {
             host_id: identity.node_id(),
             accepted_roots,
             key_dir,
+            state_dir: None,
+        })
+    }
+
+    /// Persist hosted drives as `<state_dir>/<drive>.cedrive`, the SAME files the `ce-drive` CLI
+    /// reads and writes. Point this at the CLI's drive directory and there is one drive rather than
+    /// two — a mesh-visible one and a local one that quietly diverge.
+    pub fn with_state_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.state_dir = Some(dir.into());
+        self
+    }
+
+    /// Where a drive's state file lives, if this host persists at all.
+    pub fn state_path(&self, drive_id: &str) -> Option<std::path::PathBuf> {
+        self.state_dir.as_ref().map(|d| d.join(format!("{drive_id}.cedrive")))
+    }
+
+    /// Write one drive's state to disk. Called after every mutating op that succeeded.
+    ///
+    /// A drive that accepted a write and then failed to record it is the failure this whole module
+    /// exists to prevent, so a persist error is surfaced to the caller rather than logged and
+    /// swallowed — the client needs to know the write is not durable.
+    async fn persist(&self, drive_id: &str) -> Result<(), DriveErr> {
+        let Some(path) = self.state_path(drive_id) else { return Ok(()) };
+        let state = {
+            let reg = self.registry.lock().await;
+            let Some(t) = reg.get(drive_id) else { return Ok(()) };
+            t.drive.state().clone()
+        };
+        ce_drive_core::persist::save(&path, &state).map_err(|e| {
+            tracing::error!(drive = %drive_id, path = %path.display(), error = %e,
+                            "DURABILITY FAILURE: drive mutated but state could not be written");
+            DriveErr::Internal(format!(
+                "write applied in memory but could not be persisted to {}: {e}",
+                path.display()
+            ))
         })
     }
 
@@ -397,7 +438,17 @@ impl DriveServer {
         req: DriveReq,
     ) -> Result<DriveOk, DriveErr> {
         let drive_id = req.drive.clone();
-        match req.op {
+        // Whether this op can change persisted DriveState. Share is excluded deliberately: it mints
+        // a capability, it does not touch the tree or the content map.
+        let mutates = matches!(
+            req.op,
+            DriveOp::Write { .. }
+                | DriveOp::Mkdir { .. }
+                | DriveOp::Move { .. }
+                | DriveOp::Copy { .. }
+                | DriveOp::Delete { .. }
+        );
+        let out = match req.op {
             DriveOp::Open => self.op_open(&drive_id, chain).await,
             DriveOp::Stat { path } => self.op_stat(&drive_id, &path).await,
             DriveOp::List { path, cursor, limit } => {
@@ -417,7 +468,12 @@ impl DriveServer {
             }
             DriveOp::Poll { cursor, limit } => self.op_poll(&drive_id, cursor, limit).await,
             DriveOp::Watch => self.op_watch(&drive_id).await,
+        };
+        // Persist BEFORE replying, so a client that got an ok has a durable write.
+        if mutates && out.is_ok() {
+            self.persist(&drive_id).await?;
         }
+        out
     }
 
     // ----- handlers -----

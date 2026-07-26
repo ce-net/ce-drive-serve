@@ -37,6 +37,27 @@ It is an **app over CE primitives** (`AppRequest` + content-addressed blobs + `c
 ce-drive-serve --drive team --name acme-eng
 ```
 
+### Drives are durable, and they are the SAME drives the CLI uses
+
+State files live in `--state-dir` (default `$CE_DRIVE_DIR`, else the platform data dir +
+`ce-drive`) as `<drive>.cedrive` — **exactly where the `ce-drive` CLI keeps them**. At boot the host
+*loads* each requested drive if a state file exists and only creates one when it genuinely does not,
+and it writes the state back after every mutating op, before replying.
+
+That last paragraph describes a fix, not a feature. This host used to call `create()`
+unconditionally, which builds a **new empty drive in memory**. So the drive published on the mesh
+was empty and forgot everything on restart, while the real corpus sat untouched in a `.cedrive`
+file next to it — two drives with the same name, one holding all the work and one visible over the
+mesh. Pointing the host at the CLI's directory is what makes them one drive. If you deliberately
+want the old throwaway behaviour, construct `DriveServer` without `with_state_dir`.
+
+A persist failure is returned to the caller as `Internal` rather than logged and swallowed: a drive
+that accepts a write and cannot record it must not answer "ok".
+
+The on-disk container is versioned — see `ce_drive_core::persist`. Adding a field to `DriveState`
+is a **breaking format change** (bincode is positional, and `#[serde(default)]` cannot save you),
+so it requires a new magic plus a decoder for the old layout.
+
 The host key (which IS the capability root for every drive it serves) is loaded from `--key-dir`
 (default: the CE data dir's `identity/`). To grant a peer access, the host self-issues a `ce-cap`
 chain scoped by `drive:{read,write,share,...}` + a drive-bound `path_prefix`
