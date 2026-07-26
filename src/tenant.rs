@@ -5,7 +5,8 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, bail};
-use ce_drive_core::{Drive, DriveState, Workspace};
+use ce_coord::Coord;
+use ce_drive_core::{DriveState, SyncedDrive, Workspace};
 use ce_identity::Identity;
 
 use crate::feed::Feed;
@@ -15,7 +16,13 @@ use crate::wire::Quota;
 /// `snapshot_cid` caches the CID of the last published bootstrap snapshot (the `Open` reply value),
 /// recomputed lazily when the drive advances.
 pub struct Tenant {
-    pub drive: Drive,
+    /// The drive itself, MULTI-WRITER.
+    ///
+    /// This was a single-writer `Drive`, and that is why nothing ever synced: every write through
+    /// the mesh API landed in a local CRDT that no other device followed. Opening a replicated drive
+    /// *alongside* it would only have produced a replica that no request ever wrote to. Serving from
+    /// the replicated drive is the switch.
+    pub drive: SyncedDrive,
     pub feed: Feed,
     pub workspace: Workspace,
     pub quota: Quota,
@@ -26,19 +33,37 @@ pub struct Tenant {
 impl Tenant {
     /// A fresh empty drive named `drive_id`, owned by `identity` (whose key is the cap root). A
     /// second handle to the same on-disk key backs the [`Workspace`] (it consumes its `Identity`).
-    pub fn new(drive_id: &str, identity: Identity, quota: Quota) -> Self {
-        let replica = identity.node_id_hex();
-        let drive = Drive::init(drive_id, &replica);
+    pub async fn new(
+        coord: &Coord,
+        drive_id: &str,
+        identity: Identity,
+        quota: Quota,
+        peers: &[String],
+    ) -> Result<Self> {
+        let drive = SyncedDrive::open(coord, drive_id, peers).await?;
         let workspace = Workspace::new(identity);
-        Tenant { drive, feed: Feed::new(), workspace, quota, snapshot: None }
+        Ok(Tenant { drive, feed: Feed::new(), workspace, quota, snapshot: None })
     }
 
     /// Rebuild a tenant from a persisted [`DriveState`] (e.g. a standby host resuming from a pinned
     /// snapshot). The feed restarts at 0 (clients re-bootstrap from the snapshot, then Poll forward).
-    pub fn from_state(state: DriveState, identity: Identity, quota: Quota) -> Self {
-        let drive = Drive::from_state(state);
+    /// Rebuild a tenant from durable local state.
+    ///
+    /// Uses `restore_state`, never `adopt`: restore is silent and local, while adopting would
+    /// publish every op in the drive's history one at a time -- thousands of round trips on a
+    /// long-lived drive, degrading every other app on the node while it runs.
+    pub async fn from_state(
+        coord: &Coord,
+        drive_id: &str,
+        state: DriveState,
+        identity: Identity,
+        quota: Quota,
+        peers: &[String],
+    ) -> Result<Self> {
+        let drive = SyncedDrive::open(coord, drive_id, peers).await?;
+        drive.restore_state(&state)?;
         let workspace = Workspace::new(identity);
-        Tenant { drive, feed: Feed::new(), workspace, quota, snapshot: None }
+        Ok(Tenant { drive, feed: Feed::new(), workspace, quota, snapshot: None })
     }
 }
 
@@ -72,21 +97,36 @@ impl Registry {
     }
 
     /// Create a new empty drive `drive_id` with the given billing terms. Errors if it already exists.
-    pub fn create(&mut self, drive_id: &str, quota: Quota) -> Result<()> {
+    pub async fn create(
+        &mut self,
+        coord: &Coord,
+        drive_id: &str,
+        quota: Quota,
+        peers: &[String],
+    ) -> Result<()> {
         if self.drives.contains_key(drive_id) {
             bail!("drive '{drive_id}' already exists");
         }
-        let tenant = Tenant::new(drive_id, self.identity_handle()?, quota);
+        let tenant = Tenant::new(coord, drive_id, self.identity_handle()?, quota, peers).await?;
         self.drives.insert(drive_id.to_string(), tenant);
         Ok(())
     }
 
     /// Register a drive rebuilt from persisted state (standby resume).
-    pub fn restore(&mut self, drive_id: &str, state: DriveState, quota: Quota) -> Result<()> {
+    pub async fn restore(
+        &mut self,
+        coord: &Coord,
+        drive_id: &str,
+        state: DriveState,
+        quota: Quota,
+        peers: &[String],
+    ) -> Result<()> {
         if self.drives.contains_key(drive_id) {
             bail!("drive '{drive_id}' already exists");
         }
-        let tenant = Tenant::from_state(state, self.identity_handle()?, quota);
+        let tenant =
+            Tenant::from_state(coord, drive_id, state, self.identity_handle()?, quota, peers)
+                .await?;
         self.drives.insert(drive_id.to_string(), tenant);
         Ok(())
     }
@@ -110,45 +150,16 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ce_drive_core::FileContent;
 
-    fn key_dir(tag: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir()
-            .join(format!("ce-drive-tenant-{}-{n}-{tag}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    #[test]
-    fn create_get_and_list_drives() {
-        let mut reg = Registry::new(key_dir("reg")).unwrap();
-        assert!(reg.drive_ids().is_empty());
-        assert!(reg.get("nope").is_none());
-
-        reg.create("team", Quota::default()).unwrap();
-        reg.create("personal", Quota::default()).unwrap();
-
-        assert!(reg.get("team").is_some());
-        assert!(reg.get_mut("personal").is_some());
-        let mut ids = reg.drive_ids();
-        ids.sort();
-        assert_eq!(ids, vec!["personal".to_string(), "team".to_string()]);
-    }
-
-    #[test]
-    fn duplicate_create_errors() {
-        let mut reg = Registry::new(key_dir("dup")).unwrap();
-        reg.create("team", Quota::default()).unwrap();
-        let err = reg.create("team", Quota::default()).unwrap_err();
-        assert!(err.to_string().contains("already exists"));
-    }
+    // Everything else that used to live here needs a live node: a tenant now opens a replicated log
+    // through `ce-coord`, so it cannot be built offline. Those assertions moved to
+    // `tests/registry_live.rs` rather than being dropped.
 
     #[test]
     fn host_id_hex_is_stable_64_hex() {
-        let dir = key_dir("hex");
+        let dir = std::env::temp_dir()
+            .join(format!("ce-drive-tenant-hex-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
         let reg = Registry::new(&dir).unwrap();
         let h = reg.host_id_hex().to_string();
         assert_eq!(h.len(), 64);
@@ -156,45 +167,5 @@ mod tests {
         // A second registry over the same key dir resolves the same host id (key is persisted).
         let reg2 = Registry::new(&dir).unwrap();
         assert_eq!(reg2.host_id_hex(), h);
-    }
-
-    #[test]
-    fn restore_rebuilds_drive_from_state_and_rejects_duplicates() {
-        // Build a drive, mutate it, snapshot its state, restore into a fresh registry.
-        let mut reg = Registry::new(key_dir("restore-src")).unwrap();
-        reg.create("team", Quota::default()).unwrap();
-        {
-            let t = reg.get_mut("team").unwrap();
-            t.drive.mkdir("/", "docs").unwrap();
-            let fc = FileContent::new("cid123", 10, 0o644, 1);
-            t.drive.add_file("/docs", "f.txt", fc).unwrap();
-        }
-        let state = reg.get("team").unwrap().drive.state().clone();
-
-        let mut reg2 = Registry::new(key_dir("restore-dst")).unwrap();
-        reg2.restore("team", state.clone(), Quota::default()).unwrap();
-        // The restored drive reflects the snapshot.
-        let entries = reg2.get("team").unwrap().drive.ls("/docs").unwrap();
-        assert!(entries.iter().any(|e| e.name == "f.txt"));
-        // The feed restarts at 0 (clients re-bootstrap from the snapshot, then Poll forward).
-        assert_eq!(reg2.get("team").unwrap().feed.cursor(), 0);
-        // Restoring the same id twice errors.
-        assert!(reg2.restore("team", state, Quota::default()).is_err());
-    }
-
-    #[test]
-    fn quota_is_carried_per_drive() {
-        let mut reg = Registry::new(key_dir("quota")).unwrap();
-        let q = Quota {
-            price_per_gib_month: "5".into(),
-            price_per_gib_egress: "2".into(),
-            free_tier_bytes: 1024,
-            channel_required: true,
-        };
-        reg.create("paid", q.clone()).unwrap();
-        let got = &reg.get("paid").unwrap().quota;
-        assert_eq!(got.price_per_gib_month, "5");
-        assert!(got.channel_required);
-        assert_eq!(got.free_tier_bytes, 1024);
     }
 }

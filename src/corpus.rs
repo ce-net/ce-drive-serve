@@ -343,7 +343,7 @@ mod tests {
 ///
 /// Directories are skipped: they have no bytes and nothing to extract, and their names are already
 /// carried in every child's `path` and `dir`.
-pub fn walk_facts(drive: &ce_drive_core::Drive, path: &str) -> Vec<NodeFacts> {
+pub fn walk_facts(drive: &ce_drive_core::SyncedDrive, path: &str) -> Vec<NodeFacts> {
     let mut out = Vec::new();
     let mut stack = vec![path.to_string()];
     while let Some(dir) = stack.pop() {
@@ -359,7 +359,7 @@ pub fn walk_facts(drive: &ce_drive_core::Drive, path: &str) -> Vec<NodeFacts> {
                 continue;
             }
             let Some(content) = e.content.as_ref() else { continue };
-            let meta = drive.meta_of(&child).ok().flatten();
+            let meta = drive.meta_of(&e.node_id);
             let (props, tags, links) = match meta {
                 None => (BTreeMap::new(), Vec::new(), Vec::new()),
                 Some(m) => (

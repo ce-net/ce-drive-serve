@@ -116,7 +116,8 @@ async fn remote_drive_open_write_read_and_mirror() {
     // The host serve loop runs against node B's HTTP API.
     let b_client = CeClient::new(b_url.clone());
     let mut registry = Registry::new(&b_key_dir).unwrap();
-    registry.create("team", Quota::default()).unwrap();
+    let b_coord = ce_coord::Coord::with_client(b_client.clone()).await.unwrap();
+    registry.create(&b_coord, "team", Quota::default(), &[]).await.unwrap();
     let server =
         DriveServer::new(b_client.clone(), registry, &b_key_dir, Vec::new()).unwrap();
     let serve_handle = tokio::spawn(async move {

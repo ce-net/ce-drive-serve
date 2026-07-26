@@ -100,6 +100,14 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("create {}", state_dir.display()))?;
 
+    // Peers and the coordinator come FIRST, because a drive is a replica set from the moment it
+    // opens. Building it single-writer and joining afterwards is what created two representations of
+    // the same drive.
+    let peers = discover_peers(&client, &args.peers).await;
+    let coord = ce_coord::Coord::with_client(client.clone())
+        .await
+        .context("open ce-coord (a drive is a replicated log; there is no single-writer mode)")?;
+
     let mut registry = Registry::new(&key_dir)?;
     for d in &args.drives {
         let path = state_dir.join(format!("{d}.cedrive"));
@@ -108,22 +116,17 @@ async fn main() -> Result<()> {
         match ce_drive_core::persist::load(&path)? {
             Some(state) => {
                 let files = state.content_log.len();
-                registry.restore(d, state, Quota::default())?;
+                registry.restore(&coord, d, state, Quota::default(), &peers).await?;
                 info!(drive = %d, path = %path.display(), content_ops = files,
-                      "serving drive (resumed from disk)");
+                      peers = peers.len(), "serving drive (resumed from disk into the replica set)");
             }
             None => {
-                registry.create(d, Quota::default())?;
-                info!(drive = %d, path = %path.display(),
+                registry.create(&coord, d, Quota::default(), &peers).await?;
+                info!(drive = %d, path = %path.display(), peers = peers.len(),
                       "serving drive (new — no state file yet)");
             }
         }
     }
-
-    // Always. A distributed drive that only replicates when asked is not a distributed drive, and a
-    // flag for it would be one more thing an operator (or an AI setting up infrastructure) has to
-    // know to turn on before the system does its job.
-    join_the_mesh_drive(&client, &args.drives, &state_dir, &args.peers).await;
 
     let server = DriveServer::new(client.clone(), registry, &key_dir, Vec::new())?
         .with_state_dir(&state_dir);
@@ -140,75 +143,29 @@ async fn main() -> Result<()> {
     server.run(args.poll_ms).await
 }
 
-/// Join each drive to its multi-writer replica set, and seed it from local state.
+/// Everyone else advertising `ce-drive` — the replica set assembles itself.
 ///
-/// Unconditional. Replicating across devices is the JOB, not a mode: a drive that syncs only when
-/// configured to is just a local folder with extra steps, and every flag is something an operator or
-/// an AI has to already know before the system behaves correctly.
+/// PEERS COME FROM DISCOVERY, always, with no flag to enable it. Replicating across devices is the
+/// JOB of this app, not a mode: a drive that syncs only when configured to is a local folder with
+/// extra steps, and every flag is one more thing an operator (or an AI wiring up infrastructure) has
+/// to know before the system behaves correctly. `--peer` only ADDS to what was found, for a node the
+/// DHT cannot see.
 ///
-/// PEERS COME FROM DISCOVERY. Other hosts of the same drive advertise `ce-drive`, so the replica set
-/// assembles itself the way everything else on this mesh does -- by service name, no registry, no
-/// address list. `--peer` only adds to what was found.
-///
-/// The local `.cedrive` remains the DURABLE record and is still what the host serves from. That is
-/// not hesitancy: `ce-coord` deliberately does not persist to local disk (see `replicated.rs`, "a
-/// writer that keeps its own ops on disk has to put them back into the log after a restart"), so the
-/// merged log alone is durable only while peers hold it. On a single-node drive with no peers,
-/// dropping the local record would lose the drive on the next restart.
-///
-/// Every failure is logged and skipped rather than propagated. A host that refused to start because
-/// it could not reach the mesh would be a worse host than one that serves locally and says why --
-/// and it would make the disk-full case unrecoverable.
-async fn join_the_mesh_drive(
-    client: &CeClient,
-    drives: &[String],
-    state_dir: &std::path::Path,
-    peers: &[String],
-) {
-    // Everyone advertising `ce-drive` is a candidate replica for a drive of this name; ourselves
-    // excluded, since a writer does not follow its own log.
-    let mut peers: Vec<String> = peers.to_vec();
-    if let Ok(found) = client.find_service("ce-drive").await {
-        let me = client.status().await.map(|s| s.node_id).unwrap_or_default();
-        for p in found {
-            if p != me && !peers.contains(&p) {
-                peers.push(p);
+/// Ourselves excluded: a writer does not follow its own log. Discovery failure is not fatal — a host
+/// that refused to start because the mesh was unreachable would be strictly worse than one that
+/// serves what it has and picks peers up later.
+async fn discover_peers(client: &CeClient, extra: &[String]) -> Vec<String> {
+    let mut peers: Vec<String> = extra.to_vec();
+    match client.find_service("ce-drive").await {
+        Ok(found) => {
+            let me = client.status().await.map(|s| s.node_id).unwrap_or_default();
+            for p in found {
+                if p != me && !peers.contains(&p) {
+                    peers.push(p);
+                }
             }
         }
+        Err(e) => warn!(error = %e, "drive peers: discovery failed; starting with --peer only"),
     }
-    let peers = &peers[..];
-
-    let coord = match ce_coord::Coord::with_client(client.clone()).await {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "drive sync: cannot open ce-coord; continuing single-writer");
-            return;
-        }
-    };
-    for drive in drives {
-        let path = state_dir.join(format!("{drive}.cedrive"));
-        let synced = match ce_drive_core::SyncedDrive::open(&coord, drive, peers).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(drive = %drive, error = %e, "drive sync: open failed; continuing single-writer");
-                continue;
-            }
-        };
-        match ce_drive_core::persist::load(&path) {
-            Ok(Some(state)) => match synced.adopt(&state).await {
-                Ok(r) => info!(
-                    drive = %drive, moves = r.moves, contents = r.contents, metas = r.metas,
-                    peers = peers.len(),
-                    "drive sync: adopted single-writer state into the multi-writer drive"
-                ),
-                Err(e) => warn!(drive = %drive, error = %e, "drive sync: adopt failed"),
-            },
-            // Nothing to adopt is a normal state for a drive that has never been written, and it is
-            // NOT the same as a failed read -- conflating them is how a migration silently does
-            // nothing and reports success.
-            Ok(None) => info!(drive = %drive, path = %path.display(),
-                              "drive sync: no single-writer state to adopt (fresh drive)"),
-            Err(e) => warn!(drive = %drive, error = %e, "drive sync: could not read state to adopt"),
-        }
-    }
+    peers
 }

@@ -9,8 +9,9 @@ request against a presented `ce-cap` chain via `ce_cap::authorize`, then enforce
 `path_prefix` as `ce-drive/<drive>[/<subtree>]` (mirror of ce-db's `ce-db/<collection>`); a cap
 minted for drive A cannot be replayed against drive B on the same host. Mint with
 `drive_caveat_prefix(drive, path)`. Metadata is served from `ce-drive-core`'s
-`DriveTree` CRDT + content map; bytes are content-addressed blobs (`Read` returns a `ReadPlan`, never
-bytes; `Write` commits a `path -> object_cid` binding).
+`SyncedDrive` (the `DriveTree` CRDT + content map + metadata map, each over a `ce-coord`
+multi-writer log); bytes are content-addressed blobs (`Read` returns a `ReadPlan`, never bytes;
+`Write` commits a `path -> object_cid` binding).
 
 ## Modules
 - `wire.rs` — `DriveReq`/`DriveReply`/`DriveOp`/`Entry`/`Change`/`ReadPlan`/`DriveErr` (bincode). The
@@ -18,10 +19,13 @@ bytes; `Write` commits a `path -> object_cid` binding).
 - `serve.rs` — `DriveServer`: poll `/mesh/messages`, `authorize_req` (the single gate), dispatch the
   op set, `read_plan` (ranged chunk intersection), publish the change beacon.
 - `feed.rs` — per-drive monotonic seq change log (`Poll` source of truth).
-- `tenant.rs` — `Registry`/`Tenant`: multi-drive, each a `Drive` + `Feed` + `Quota`; host key = root.
+- `tenant.rs` — `Registry`/`Tenant`: multi-drive, each a `SyncedDrive` + `Feed` + `Quota`; host key =
+  root. Creating or restoring a tenant is ASYNC and takes a `&Coord` + the peer list: a drive is a
+  replica set from the moment it opens, so there is no single-writer mode to fall back to.
 
 ## Dependencies (all by path)
-`ce-rs` (AppRequest/blobs), `ce-cap` (authorize), `ce-drive-core` (DriveTree), `ce-identity`.
+`ce-rs` (AppRequest/blobs), `ce-cap` (authorize), `ce-drive-core` (SyncedDrive), `ce-coord`,
+`ce-identity`.
 The `[patch]` block redirects the git `ce-rs`/`ce-cap` (pulled via ce-coord/rdev transitively) onto
 the local path copies so the graph collapses onto ONE `ce-rs`/`ce-cap`.
 
@@ -32,7 +36,10 @@ no emojis. Money = `Amount` base units, decimal strings. Author: Leif Rydenfalk.
 ## Tests
 - `cargo test --lib` — unit: `feed` (gap-free/resumable/limit-clamp paging), `serve` (norm_path,
   no_dotdot, enforce_prefix subtree rules, read_plan boundaries incl. zero-len/empty/over-read,
-  derive_nonce determinism, parse_node_id), `tenant` (create/dup/restore/quota/host-id).
+  derive_nonce determinism, parse_node_id), `tenant` (host-id stability).
+- `tests/registry_live.rs` — create/duplicate/restore/quota + drive-survives-a-restart, against an
+  ephemeral in-process node. These were `tenant` unit tests until the host moved to `SyncedDrive`;
+  opening a drive now needs a real node, so they run live rather than being deleted.
 - `tests/authorize.rs` — cap gate: subtree read, wrong-audience/expired/out-of-prefix/`..` denied,
   attenuation can't widen, revoked subtree denied.
 - `tests/authorize_props.rs` — deeper gate + a PROPERTY test: a child delegation can never authorize
@@ -53,4 +60,5 @@ no emojis. Money = `Amount` base units, decimal strings. Author: Leif Rydenfalk.
   converge; once up, every assertion is hard.
 
 ## Build/verify
-Shared cargo target-dir is configured at `~/ce-net/.cargo-shared`; just run `cargo build`/`cargo test`.
+`cargo build` / `cargo test` (a shared `CARGO_TARGET_DIR`, if the checkout has one, is a local
+developer setting and not part of this repo).

@@ -209,15 +209,15 @@ fn enforce_prefix(scope: &str, path: &str) -> Result<(), DriveErr> {
 
 /// The etag for a node = its current content version key (CID + mtime), or the node id for dirs /
 /// empty files. Cheap optimistic-concurrency token (matches one content-map version).
-fn etag_for(drive: &ce_drive_core::Drive, node_id: &str) -> String {
-    match drive.content().get(node_id) {
+fn etag_for(drive: &ce_drive_core::SyncedDrive, node_id: &str) -> String {
+    match drive.content_of(node_id) {
         Some(c) => format!("{}:{}", c.cid(), c.mtime_ms),
         None => format!("dir:{node_id}"),
     }
 }
 
 /// Build a wire [`Entry`] from a core [`DirEntry`] under `parent_path`.
-fn entry_of(drive: &ce_drive_core::Drive, parent_path: &str, e: &DirEntry) -> Entry {
+fn entry_of(drive: &ce_drive_core::SyncedDrive, parent_path: &str, e: &DirEntry) -> Entry {
     let path = if parent_path == "/" {
         format!("/{}", e.name)
     } else {
@@ -310,7 +310,7 @@ impl DriveServer {
         let state = {
             let reg = self.registry.lock().await;
             let Some(t) = reg.get(drive_id) else { return Ok(()) };
-            t.drive.state().clone()
+            t.drive.to_state()
         };
         ce_drive_core::persist::save(&path, &state).map_err(|e| {
             tracing::error!(drive = %drive_id, path = %path.display(), error = %e,
@@ -686,7 +686,7 @@ impl DriveServer {
         let state_bytes = {
             let reg = self.registry.lock().await;
             let t = reg.get(drive_id).ok_or(DriveErr::NotFound)?;
-            serde_json::to_vec(t.drive.state()).map_err(|e| DriveErr::Internal(e.to_string()))?
+            serde_json::to_vec(&t.drive.to_state()).map_err(|e| DriveErr::Internal(e.to_string()))?
         };
         let cid = self
             .client
@@ -749,8 +749,8 @@ impl DriveServer {
         let object_cid = {
             let reg = self.registry.lock().await;
             let t = reg.get(drive_id).ok_or(DriveErr::NotFound)?;
-            let node = t.drive.tree().resolve(&norm_path(path)).ok_or(DriveErr::NotFound)?;
-            let content = t.drive.content().get(&node).ok_or(DriveErr::NotFound)?;
+            let node = t.drive.resolve(&norm_path(path)).ok_or(DriveErr::NotFound)?;
+            let content = t.drive.content_of(&node).ok_or(DriveErr::NotFound)?;
             content.cid().to_string()
         };
         // Fetch the manifest and compute the intersecting chunks.
@@ -778,7 +778,7 @@ impl DriveServer {
         let t = reg.get_mut(drive_id).ok_or(DriveErr::NotFound)?;
 
         // Optimistic concurrency: if the file already exists, its current etag must match base_etag.
-        if let Some(node) = t.drive.tree().resolve(&norm_path(path)) {
+        if let Some(node) = t.drive.resolve(&norm_path(path)) {
             let current = etag_for(&t.drive, &node);
             if let Some(base) = &base_etag {
                 if base != &current {
@@ -791,6 +791,7 @@ impl DriveServer {
         let node_id = t
             .drive
             .add_file(&parent, &name, fc)
+            .await
             .map_err(|e| DriveErr::Internal(e.to_string()))?;
         let etag = etag_for(&t.drive, &node_id);
         let full_path = norm_path(path);
@@ -808,7 +809,7 @@ impl DriveServer {
             let mut reg = self.registry.lock().await;
             let t = reg.get_mut(drive_id).ok_or(DriveErr::NotFound)?;
             let node_id =
-                t.drive.mkdir(&parent, &name).map_err(|e| DriveErr::Internal(e.to_string()))?;
+                t.drive.mkdir(&parent, &name).await.map_err(|e| DriveErr::Internal(e.to_string()))?;
             let etag = etag_for(&t.drive, &node_id);
             let seq = t.feed.record(norm_path(path), node_id.clone(), ChangeKind::Created, etag);
             (node_id, seq)
@@ -822,9 +823,10 @@ impl DriveServer {
         let (node_id, seq) = {
             let mut reg = self.registry.lock().await;
             let t = reg.get_mut(drive_id).ok_or(DriveErr::NotFound)?;
-            let node = t.drive.tree().resolve(&norm_path(from)).ok_or(DriveErr::NotFound)?;
+            let node = t.drive.resolve(&norm_path(from)).ok_or(DriveErr::NotFound)?;
             t.drive
                 .mv(&norm_path(from), &to_parent, &to_name)
+                .await
                 .map_err(|e| DriveErr::Internal(e.to_string()))?;
             let etag = etag_for(&t.drive, &node);
             let seq = t.feed.record(
@@ -845,13 +847,14 @@ impl DriveServer {
         let (node_id, seq) = {
             let mut reg = self.registry.lock().await;
             let t = reg.get_mut(drive_id).ok_or(DriveErr::NotFound)?;
-            let src = t.drive.tree().resolve(&norm_path(from)).ok_or(DriveErr::NotFound)?;
-            let content = t.drive.content().get(&src).cloned().ok_or(DriveErr::NotFound)?;
+            let src = t.drive.resolve(&norm_path(from)).ok_or(DriveErr::NotFound)?;
+            let content = t.drive.content_of(&src).ok_or(DriveErr::NotFound)?;
             let fc =
                 ce_drive_core::FileContent::new(content.locator, content.size, content.mode, now_ms());
             let node_id = t
                 .drive
                 .add_file(&to_parent, &to_name, fc)
+                .await
                 .map_err(|e| DriveErr::Internal(e.to_string()))?;
             let etag = etag_for(&t.drive, &node_id);
             let seq = t.feed.record(norm_path(to), node_id.clone(), ChangeKind::Created, etag);
@@ -870,8 +873,8 @@ impl DriveServer {
         let seq = {
             let mut reg = self.registry.lock().await;
             let t = reg.get_mut(drive_id).ok_or(DriveErr::NotFound)?;
-            let node = t.drive.tree().resolve(&norm_path(path)).ok_or(DriveErr::NotFound)?;
-            t.drive.rm(&norm_path(path)).map_err(|e| DriveErr::Internal(e.to_string()))?;
+            let node = t.drive.resolve(&norm_path(path)).ok_or(DriveErr::NotFound)?;
+            t.drive.rm(&norm_path(path)).await.map_err(|e| DriveErr::Internal(e.to_string()))?;
             t.feed.record(norm_path(path), node, ChangeKind::Deleted, String::new())
         };
         self.publish_beacon(drive_id, seq).await;
@@ -983,8 +986,8 @@ impl DriveServer {
     async fn op_meta(&self, drive_id: &str, path: &str) -> Result<DriveOk, DriveErr> {
         let reg = self.registry.lock().await;
         let t = reg.get(drive_id).ok_or(DriveErr::NotFound)?;
-        let node = t.drive.tree().resolve(&norm_path(path)).ok_or(DriveErr::NotFound)?;
-        let meta = t.drive.meta_of(&norm_path(path)).map_err(|e| DriveErr::Internal(e.to_string()))?;
+        let node = t.drive.resolve(&norm_path(path)).ok_or(DriveErr::NotFound)?;
+        let meta = t.drive.meta_of(&node);
         let (props, tags, links) = match meta {
             // A node with no metadata is not an error: it is a file nobody has said anything about.
             None => (Vec::new(), Vec::new(), Vec::new()),
@@ -1011,8 +1014,8 @@ impl DriveServer {
         let t = reg.get_mut(drive_id).ok_or(DriveErr::NotFound)?;
         let p = norm_path(path);
         match value {
-            Some(v) => t.drive.set_prop(&p, key, &v),
-            None => t.drive.unset_prop(&p, key),
+            Some(v) => t.drive.set_prop(&p, key, &v).await,
+            None => t.drive.unset_prop(&p, key).await,
         }
         .map_err(|e| DriveErr::Internal(e.to_string()))?;
         Ok(DriveOk::Deleted)
@@ -1028,7 +1031,7 @@ impl DriveServer {
         let mut reg = self.registry.lock().await;
         let t = reg.get_mut(drive_id).ok_or(DriveErr::NotFound)?;
         let p = norm_path(path);
-        if remove { t.drive.remove_tag(&p, tag) } else { t.drive.add_tag(&p, tag) }
+        if remove { t.drive.remove_tag(&p, tag).await } else { t.drive.add_tag(&p, tag).await }
             .map_err(|e| DriveErr::Internal(e.to_string()))?;
         Ok(DriveOk::Deleted)
     }
@@ -1045,7 +1048,7 @@ impl DriveServer {
         let t = reg.get_mut(drive_id).ok_or(DriveErr::NotFound)?;
         let p = norm_path(path);
         let target = ce_drive_core::meta::LinkTarget::parse(to);
-        if remove { t.drive.unlink(&p, rel, target) } else { t.drive.link(&p, rel, target) }
+        if remove { t.drive.unlink(&p, rel, target).await } else { t.drive.link(&p, rel, target).await }
             .map_err(|e| DriveErr::Internal(e.to_string()))?;
         Ok(DriveOk::Deleted)
     }
@@ -1054,15 +1057,15 @@ impl DriveServer {
         let reg = self.registry.lock().await;
         let t = reg.get(drive_id).ok_or(DriveErr::NotFound)?;
         let target = ce_drive_core::meta::LinkTarget::parse(to);
-        let links = t.drive.meta().backlinks(&target);
+        let links = t.drive.backlinks(&target);
         Ok(DriveOk::Backlinks { links })
     }
 
     async fn op_versions(&self, drive_id: &str, path: &str) -> Result<DriveOk, DriveErr> {
         let reg = self.registry.lock().await;
         let t = reg.get(drive_id).ok_or(DriveErr::NotFound)?;
-        let node = t.drive.tree().resolve(&norm_path(path)).ok_or(DriveErr::NotFound)?;
-        let content = t.drive.content().get(&node).ok_or(DriveErr::NotFound)?;
+        let node = t.drive.resolve(&norm_path(path)).ok_or(DriveErr::NotFound)?;
+        let content = t.drive.content_of(&node).ok_or(DriveErr::NotFound)?;
         let versions = content
             .versions
             .iter()
@@ -1093,7 +1096,7 @@ impl DriveServer {
 }
 
 /// Stat a path to a wire [`Entry`] (file or dir). Returns `None` if the path doesn't resolve.
-fn stat_entry(drive: &ce_drive_core::Drive, path: &str) -> Option<Entry> {
+fn stat_entry(drive: &ce_drive_core::SyncedDrive, path: &str) -> Option<Entry> {
     let norm = norm_path(path);
     if norm == "/" {
         return Some(Entry {
@@ -1107,10 +1110,9 @@ fn stat_entry(drive: &ce_drive_core::Drive, path: &str) -> Option<Entry> {
             doc_id: None,
         });
     }
-    let node = drive.tree().resolve(&norm)?;
-    let edge = drive.tree().edge(&node)?;
-    let is_dir = matches!(edge.kind, NodeKind::Dir);
-    let (size, mtime_ms, object_cid, doc_id) = match drive.content().get(&node) {
+    let node = drive.resolve(&norm)?;
+    let is_dir = drive.with_tree(|t| t.edge(&node).map(|e| matches!(e.kind, NodeKind::Dir)))?;
+    let (size, mtime_ms, object_cid, doc_id) = match drive.content_of(&node) {
         Some(c) => (c.size, c.mtime_ms, Some(c.cid().to_string()), c.doc_id.clone()),
         None => (0, 0, None, None),
     };

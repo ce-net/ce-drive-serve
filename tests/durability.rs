@@ -9,7 +9,6 @@
 //! `Registry::restore()` already existed and nothing called it.
 
 use ce_drive_core::{Drive, FileContent, persist};
-use ce_drive_serve::{Registry, Quota};
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,26 +31,9 @@ fn drive_with_a_file(name: &str, replica: &str) -> ce_drive_core::DriveState {
     d.state().clone()
 }
 
-#[test]
-fn a_drive_survives_a_restart() {
-    let state_dir = temp_dir("restart");
-    let key_dir = temp_dir("restart-key");
-    let path = state_dir.join("team.cedrive");
-
-    // --- first boot: a drive with real content, persisted the way the host now does ---
-    let state = drive_with_a_file("team", "abcd");
-    persist::save(&path, &state).unwrap();
-
-    // --- restart: the host loads instead of creating ---
-    let loaded = persist::load(&path).unwrap().expect("state file is there");
-    let mut reg = Registry::new(&key_dir).unwrap();
-    reg.restore("team", loaded, Quota::default()).unwrap();
-
-    let t = reg.get("team").expect("drive restored");
-    let entries = t.drive.ls("/docs").unwrap();
-    assert_eq!(entries.len(), 1, "the file survived the restart");
-    assert_eq!(entries[0].name, "report.md");
-}
+// `a_drive_survives_a_restart` moved to `tests/registry_live.rs`: restoring a drive now opens a
+// replicated log, which needs a live node. The bug it guards is unchanged -- boot must LOAD, not
+// create -- and the persist-format properties below stay here because they are pure.
 
 #[test]
 fn restore_preserves_stable_node_ids() {

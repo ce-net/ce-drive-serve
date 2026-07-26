@@ -21,7 +21,17 @@ It is an **app over CE primitives** (`AppRequest` + content-addressed blobs + `c
   op*, so a cap minted for one drive can never be replayed against another drive on the same host. A
   cap whose prefix is not in this namespace authorizes nothing. Mint these with
   `ce_drive_serve::drive_caveat_prefix(drive, path)`.
-- Metadata is answered from the [`ce-drive-core`](../ce-drive) `DriveTree` CRDT + content map.
+- Metadata is answered from [`ce-drive-core`](https://github.com/ce-net/ce-drive)'s **`SyncedDrive`**
+  — the `DriveTree` CRDT + content map + metadata map, each riding a `ce-coord` multi-writer log.
+- **Every hosted drive is replicated, always.** There is no flag for it and there should not be one:
+  a drive that syncs only when configured to is a local folder with extra steps. Peers come from
+  DISCOVERY (everyone advertising `ce-drive`), so the replica set assembles itself; `--peer` only
+  adds a node the DHT cannot see. Two devices writing the same drive now converge instead of racing.
+- The drive is **also** written to `<state-dir>/<drive>.cedrive` after every mutation. That is not
+  redundancy for its own sake: `ce-coord` deliberately does not persist to local disk, so on a drive
+  with no reachable peers the merged log is durable only while this process lives. On boot the host
+  LOADS that file and `restore_state`s it into the replicated drive — silently and locally, never by
+  re-proposing history op by op.
 - **Bytes never travel on the metadata channel.** `Read` returns a `ReadPlan` (the manifest CID +
   the chunk refs covering the requested range); the client fetches those chunks directly from the
   content-addressed blob store and verifies each against its CID (content addressing *is* the
@@ -72,6 +82,5 @@ expiry + on-chain `RevokeCapability` (subtree kill within ~10s).
 
 ## Layering
 
-`ce-drive-serve → { ce-rs (AppRequest/blobs), ce-cap (authorize), ce-drive-core (DriveTree CRDT) }`
-
-See `PLAN/11-ce-drive-mesh-api.md` for the full design.
+`ce-drive-serve → { ce-rs (AppRequest/blobs), ce-cap (authorize), ce-drive-core (SyncedDrive),
+ce-coord (the multi-writer logs a SyncedDrive rides) }`
