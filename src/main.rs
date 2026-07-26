@@ -31,15 +31,12 @@ struct Args {
     /// serves the drive that actually holds your files rather than a fresh empty one.
     #[arg(long)]
     state_dir: Option<PathBuf>,
-    /// Also open each drive as a MULTI-WRITER SyncedDrive and adopt its single-writer state into it.
+    /// Extra peer NodeIds to follow, beyond the ones discovery finds.
     ///
-    /// Opt-in on purpose. It proves opening, adoption and convergence against real peers WITHOUT
-    /// touching the request path: the host keeps serving from the single-writer drive, so a fault
-    /// here degrades to a log line rather than a broken drive. Serving from the synced drive is a
-    /// later, separate step.
-    #[arg(long)]
-    synced: bool,
-    /// Peer NodeIds whose writer logs to follow for `--synced` (repeatable).
+    /// Almost never needed: peers are DISCOVERED. Syncing is what a distributed drive is for, so it
+    /// is not a mode you switch on -- there is no `--synced` flag and there should not be one. This
+    /// exists only for a peer that cannot be discovered (a node behind something that breaks the
+    /// DHT), and anything set here is additive to what discovery already found.
     #[arg(long = "peer")]
     peers: Vec<String>,
     /// Drive ids to create and serve (repeatable).
@@ -123,9 +120,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    if args.synced {
-        adopt_into_synced(&client, &args.drives, &state_dir, &args.peers).await;
-    }
+    // Always. A distributed drive that only replicates when asked is not a distributed drive, and a
+    // flag for it would be one more thing an operator (or an AI setting up infrastructure) has to
+    // know to turn on before the system does its job.
+    join_the_mesh_drive(&client, &args.drives, &state_dir, &args.peers).await;
 
     let server = DriveServer::new(client.clone(), registry, &key_dir, Vec::new())?
         .with_state_dir(&state_dir);
@@ -142,27 +140,48 @@ async fn main() -> Result<()> {
     server.run(args.poll_ms).await
 }
 
-/// Open each drive as a multi-writer [`SyncedDrive`] and adopt its single-writer state.
+/// Join each drive to its multi-writer replica set, and seed it from local state.
 ///
-/// Step (b) of the switch: it proves the whole migration path -- open a Coord, open the merged logs,
-/// replay an existing `.cedrive` into them, converge with peers -- while the host continues serving
-/// from the single-writer drive. Nothing here can break a request, which is the point of doing it
-/// this way round: adoption replays every op in a drive's history, and that deserves to be observed
-/// once before anything depends on it.
+/// Unconditional. Replicating across devices is the JOB, not a mode: a drive that syncs only when
+/// configured to is just a local folder with extra steps, and every flag is something an operator or
+/// an AI has to already know before the system behaves correctly.
+///
+/// PEERS COME FROM DISCOVERY. Other hosts of the same drive advertise `ce-drive`, so the replica set
+/// assembles itself the way everything else on this mesh does -- by service name, no registry, no
+/// address list. `--peer` only adds to what was found.
+///
+/// The local `.cedrive` remains the DURABLE record and is still what the host serves from. That is
+/// not hesitancy: `ce-coord` deliberately does not persist to local disk (see `replicated.rs`, "a
+/// writer that keeps its own ops on disk has to put them back into the log after a restart"), so the
+/// merged log alone is durable only while peers hold it. On a single-node drive with no peers,
+/// dropping the local record would lose the drive on the next restart.
 ///
 /// Every failure is logged and skipped rather than propagated. A host that refused to start because
-/// a *preview* of multi-writer failed would be a worse host than one that serves single-writer and
-/// says why.
-async fn adopt_into_synced(
+/// it could not reach the mesh would be a worse host than one that serves locally and says why --
+/// and it would make the disk-full case unrecoverable.
+async fn join_the_mesh_drive(
     client: &CeClient,
     drives: &[String],
     state_dir: &std::path::Path,
     peers: &[String],
 ) {
+    // Everyone advertising `ce-drive` is a candidate replica for a drive of this name; ourselves
+    // excluded, since a writer does not follow its own log.
+    let mut peers: Vec<String> = peers.to_vec();
+    if let Ok(found) = client.find_service("ce-drive").await {
+        let me = client.status().await.map(|s| s.node_id).unwrap_or_default();
+        for p in found {
+            if p != me && !peers.contains(&p) {
+                peers.push(p);
+            }
+        }
+    }
+    let peers = &peers[..];
+
     let coord = match ce_coord::Coord::with_client(client.clone()).await {
         Ok(c) => c,
         Err(e) => {
-            warn!(error = %e, "--synced: cannot open ce-coord; continuing single-writer");
+            warn!(error = %e, "drive sync: cannot open ce-coord; continuing single-writer");
             return;
         }
     };
@@ -171,7 +190,7 @@ async fn adopt_into_synced(
         let synced = match ce_drive_core::SyncedDrive::open(&coord, drive, peers).await {
             Ok(s) => s,
             Err(e) => {
-                warn!(drive = %drive, error = %e, "--synced: open failed; continuing single-writer");
+                warn!(drive = %drive, error = %e, "drive sync: open failed; continuing single-writer");
                 continue;
             }
         };
@@ -180,16 +199,16 @@ async fn adopt_into_synced(
                 Ok(r) => info!(
                     drive = %drive, moves = r.moves, contents = r.contents, metas = r.metas,
                     peers = peers.len(),
-                    "--synced: adopted single-writer state into the multi-writer drive"
+                    "drive sync: adopted single-writer state into the multi-writer drive"
                 ),
-                Err(e) => warn!(drive = %drive, error = %e, "--synced: adopt failed"),
+                Err(e) => warn!(drive = %drive, error = %e, "drive sync: adopt failed"),
             },
             // Nothing to adopt is a normal state for a drive that has never been written, and it is
             // NOT the same as a failed read -- conflating them is how a migration silently does
             // nothing and reports success.
             Ok(None) => info!(drive = %drive, path = %path.display(),
-                              "--synced: no single-writer state to adopt (fresh drive)"),
-            Err(e) => warn!(drive = %drive, error = %e, "--synced: could not read state to adopt"),
+                              "drive sync: no single-writer state to adopt (fresh drive)"),
+            Err(e) => warn!(drive = %drive, error = %e, "drive sync: could not read state to adopt"),
         }
     }
 }
